@@ -1,0 +1,13 @@
+﻿.moodbooster-autopub .mb-actions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+}
+
+.moodbooster-autopub .mb-actions form {
+    margin: 0;
+}
+
+.moodbooster-autopub .mb-settings table.form-table th {
+    width: 220px;
+}
