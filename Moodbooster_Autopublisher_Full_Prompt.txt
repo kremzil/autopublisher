@@ -1,0 +1,404 @@
+ПОЛНОЦЕННЫЙ ПРОМПТ ДЛЯ CODEX/COPILOT
+Проект: Moodbooster Autopublisher (WordPress + OpenAI Responses API)
+Задача: сгенерировать ПОЛНОСТЬЮ РАБОЧИЙ плагин WordPress, который:
+— забирает статьи из указанных источников (мода/лайфстайл Европа),
+— переводит на словацкий (sk_SK) и редакционно переписывает,
+— выбирает релевантное изображение из ЭТОЙ ЖЕ статьи,
+— избегает дублей тем,
+— публикует (или кладёт в черновик) согласно настройкам,
+— имеет страницу настроек, лог в админке, планировщик по WP‑Cron и WP‑CLI команды,
+— совместим с темой Newspaper 12 через СТАНДАРТНЫЕ поля WP.
+
+--------------------------------------------------------------------
+0) ТРЕБОВАНИЯ К КОДУ И СТРУКТУРЕ
+--------------------------------------------------------------------
+• Язык: PHP 8.1+, declare(strict_types=1), пространства имён: `Moodbooster\AutoPub`.
+• Код-стиль: PSR‑12, санитизация/экранирование в админке и при выводе.
+• Текстовый домен: moodbooster-autopub (готовность к i18n).
+• Минимальные зависимости: использовать WP HTTP API (wp_remote_*), Settings API, WP‑Cron, WP‑CLI, REST/медиа.
+• Структура файлов (СОЗДАЙ РЕАЛЬНЫЕ ФАЙЛЫ И КЛАССЫ):
+moodbooster-autopublisher/
+  moodbooster-autopublisher.php         # bootstrap (хедер плагина, автозагрузка, хуки)
+  src/Admin/SettingsPage.php            # страница настроек (Settings -> Moodbooster Autopublisher)
+  src/Admin/LogsTable.php               # WP_List_Table для логов
+  src/Run/Scheduler.php                 # WP‑Cron (активация/деактивация/выполнение)
+  src/Run/Cli.php                       # WP‑CLI команды
+  src/Sources/SourceInterface.php
+  src/Sources/FashionPost.php
+  src/Sources/EuropaWire.php
+  src/Sources/EllePolska.php
+  src/Sources/MiastoKobiet.php
+  src/Sources/MarieClaireHU.php
+  src/Sources/FashionStreetHU.php
+  src/Sources/LOfficielBE.php
+  src/Sources/TogetherMagazineBE.php
+  src/Pipeline/Planner.php
+  src/Pipeline/Writer.php
+  src/Pipeline/Editor.php
+  src/Pipeline/Publisher.php
+  src/Pipeline/Images.php
+  src/Pipeline/Translate.php
+  src/Pipeline/Dedup.php
+  src/OpenAI/Client.php                 # обёртка над OpenAI Responses API
+  src/Http/Client.php                   # обёртка над wp_remote_*()
+  src/Util/Log.php
+  src/Util/Html.php
+  assets/admin.css
+  readme.txt
+
+• (Не обязательно, но желательно) Тонкие адаптеры, чтобы переиспользовать имеющиеся классы:
+  class-acs-autopublisher.php, class-acs-openai.php, class-acs-images.php, class-acs-utils.php
+
+--------------------------------------------------------------------
+1) ИСТОЧНИКИ СТАТЕЙ (источник → перевод на словацкий)
+--------------------------------------------------------------------
+Реализуй по классу на источник, все реализуют общий интерфейс:
+
+<?php
+namespace Moodbooster\AutoPub\Sources;
+interface SourceInterface {
+    /** @return array<array{source:string,url:string,title:string,dt?:string,author?:string,summary?:string,image_url?:string}> */
+    public function fetch(int $max = 20): array;
+}
+
+Список источников (сначала RSS, при его отсутствии — HTML):
+• FashionPost.pl — https://fashionpost.pl/
+• EuropaWire — https://news.europawire.eu/feed/
+• Elle Polska — https://www.elle.pl/ (попробовать найти RSS)
+• Miasto Kobiet — https://www.miastokobiet.pl/
+• Marie Claire Hungary — вход с https://www.marieclaireinternational.com/markets/hungary → локальный сайт
+• Fashion Street Online Magazine — https://fashionstreetonline.hu/ (HU/EN)
+• L’Officiel Belgique / België — https://www.lofficiel.be/
+• Together Magazine (Belgium) — https://togethermag.eu/
+
+Правила инжеста:
+• Вежливый краулинг: respect robots.txt, ETag/If-Modified-Since, пауза 500–1000 мс, UA: “MoodboosterAutopublisher/1.0 (+site)”. 
+• Возвращай: canonical URL, title, published time, author, summary, image_url (лид из тела статьи либо og:image).
+• Нормализуй HTML (убрать скрипты/iframes/трекеры), title/summary очищать от пробелов/непеч.символов.
+• Для каждого RawItem посчитай fingerprint: `sha1(source + canonical_url)`.
+
+--------------------------------------------------------------------
+2) ДЕДУПЛИКАЦИЯ И НОВИЗНА
+--------------------------------------------------------------------
+Перед переводом/генерацией:
+• Если есть пост с метой `_mb_source_fp` = fingerprint → пропустить.
+• Проверка похожести заголовка к N=500 последним заголовкам (Levenshtein/метафон): >0.90 → пропустить.
+• (Опционально) Косинусная похожесть эмбеддингов заголовков: >0.90 → пропустить. Вектор сохранить в `_mb_title_emb`.
+• Если найден “похожий” пост моложе 30 дней → не создавать новый, а запустить UPDATE FLOW (в начало контента вставить блок “Aktualizácia: …” с кратким доп.резюме).
+
+--------------------------------------------------------------------
+3) ПЕРЕВОД И НАПИСАНИЕ (OpenAI Responses API + Structured Outputs)
+--------------------------------------------------------------------
+• Используй Responses API с **Structured Outputs** (жёсткая JSON Schema-валидация).
+• Temperature 0–0.2. Сохраняй именованные сущности (люди/бренды/места) в оригинале; единицы/валюту локализуй в скобках.
+• Процесс:
+  (A) Planner → выбор темы/план на основе источника и внутреннего корпуса (RAG через твой индекс — опционально).
+  (B) Writer → полноценный словацкий черновик и метаданные по JSON‑схеме.
+  (C) Editor → автоматическая валидация качества (people‑first/helpful). Если провален порог — статус “needs_review” (draft).
+
+• Если JSON невалиден → 1 ретрай; затем лог и пропуск материала.
+
+JSON‑схемы (использовать как Structured Outputs в Responses API):
+
+[Planner.schema.json]
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlannerOutput",
+  "type": "object",
+  "required": ["topic", "why_now", "intent", "outline", "internal_links", "image_subject"],
+  "properties": {
+    "topic": { "type": "string", "minLength": 8, "maxLength": 140 },
+    "why_now": { "type": "string", "minLength": 20, "maxLength": 400 },
+    "intent": { "type": "string", "enum": ["informational","howto","listicle","analysis","news"] },
+    "audience": { "type": "string", "minLength": 5, "maxLength": 140 },
+    "outline": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["h2","bullets"],
+        "properties": {
+          "h2": { "type": "string", "minLength": 3, "maxLength": 90 },
+          "bullets": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 6,
+            "items": { "type": "string", "minLength": 3, "maxLength": 120 }
+          }
+        }
+      }
+    },
+    "internal_links": {
+      "type": "array",
+      "uniqueItems": true,
+      "minItems": 1,
+      "items": { "type": "string", "format": "uri" }
+    },
+    "update_target_url": { "type": "string", "format": "uri" },
+    "tags": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 8,
+      "items": { "type": "string", "minLength": 2, "maxLength": 30 }
+    },
+    "image_subject": { "type": "string", "minLength": 3, "maxLength": 120 },
+    "entity_type": { "type": "string", "enum": ["person","brand","event","object","place"] }
+  }
+}
+
+[Writer.schema.json]
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WriterOutput",
+  "type": "object",
+  "required": ["title_variants","body_html","excerpt","tags","internal_links","image_caption"],
+  "properties": {
+    "title_variants": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 7,
+      "items": { "type": "string", "minLength": 8, "maxLength": 70 }
+    },
+    "seo_title": { "type": "string", "minLength": 10, "maxLength": 60 },
+    "seo_description": { "type": "string", "minLength": 50, "maxLength": 160 },
+    "body_html": {
+      "type": "string",
+      "minLength": 1200,
+      "description": "Only allow <p>, <h3>, <strong>, <em>, <blockquote>, <br>."
+    },
+    "excerpt": { "type": "string", "minLength": 80, "maxLength": 160 },
+    "tags": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 8,
+      "items": { "type": "string", "minLength": 2, "maxLength": 30 }
+    },
+    "internal_links": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["url","anchor"],
+        "properties": {
+          "url": { "type": "string", "format": "uri" },
+          "anchor": { "type": "string", "minLength": 2, "maxLength": 80 }
+        }
+      }
+    },
+    "citations": {
+      "type": "array",
+      "items": { "type": "string", "format": "uri" }
+    },
+    "image_caption": { "type": "string", "minLength": 10, "maxLength": 140 }
+  }
+}
+
+[Editor.schema.json]
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EditorGate",
+  "type": "object",
+  "required": ["approval","reasons","quality_scores"],
+  "properties": {
+    "approval": { "type": "boolean" },
+    "reasons": { "type": "array", "items": { "type": "string", "minLength": 3 }, "minItems": 0 },
+    "quality_scores": {
+      "type": "object",
+      "required": ["helpful","originality","clarity"],
+      "properties": {
+        "helpful": { "type": "number", "minimum": 0, "maximum": 1 },
+        "originality": { "type": "number", "minimum": 0, "maximum": 1 },
+        "clarity": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "fixes_suggested": {
+      "type": "object",
+      "properties": {
+        "headline_to_use": { "type": "string" },
+        "sections_to_expand": { "type": "array", "items": { "type": "string" } },
+        "add_faq": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
+
+[ImagePick.schema.json]
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ImagePick",
+  "type": "object",
+  "required": ["candidates"],
+  "properties": {
+    "candidates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["source_url","width","height"],
+        "properties": {
+          "source_url": { "type": "string", "format": "uri" },
+          "width": { "type": "integer", "minimum": 640 },
+          "height": { "type": "integer", "minimum": 360 },
+          "license": { "type": "string" },
+          "credit": { "type": "string" }
+        }
+      }
+    }
+  }
+}
+
+--------------------------------------------------------------------
+4) ИЗОБРАЖЕНИЯ (ТОЛЬКО ИЗ ТОЙ ЖЕ СТАТЬИ)
+--------------------------------------------------------------------
+• Брать лид‑изображение из тела статьи; если нет — og:image. 
+• Скачивать сервером и прикреплять через `media_sideload_image()`; на успех — делать featured image.
+• Минимальные размеры: настраиваются в админке; при несоответствии — пропуск материала.
+• Хранить мету: `_mb_image_source_url`, опционально license/credit. Избегать дублей по хэшу/URL.
+• Обеспечить кроп/ресайз в 16:9 для фичерда.
+
+--------------------------------------------------------------------
+5) ПУБЛИКАЦИЯ В WORDPRESS
+--------------------------------------------------------------------
+• Создавать пост стандартными полями: title, content (body_html), excerpt, категории/теги, featured.
+• Режим публикации: указывается в настройках — сразу publish или draft.
+• `post_date`: если есть дата источника — использовать её (или текущее время).
+• Метаполя:
+  _mb_source, _mb_source_url, _mb_source_fp,
+  _mb_author_original, _mb_published_original,
+  _mb_image_source_url, _mb_title_emb, _mb_pipeline_version.
+• Фильтры для тонкой подгонки под тему: 
+  `moodbooster_autopub_post_args`, `moodbooster_autopub_post_meta`.
+• Совместимость с Newspaper 12: ИСПОЛЬЗУЕМ только стандартные поля WP — без частных мета темы.
+
+--------------------------------------------------------------------
+6) СТРАНИЦА НАСТРОЕК (Settings API) + КРОН + ЛОГИ
+--------------------------------------------------------------------
+Settings → “Moodbooster Autopublisher”
+Поля:
+  – OpenAI API Key (password).
+  – Переключатели источников (checkbox).
+  – Fetch mode: “RSS preferred | HTML fallback”.
+  – Publishing mode: radio: draft | publish (по умолчанию draft).
+  – Run cadence (WP‑Cron): hourly | twicedaily | daily (+ custom через cron_schedules при необходимости).
+  – Max new posts per run (int).
+  – Целевая локаль: фиксированно sk_SK.
+  – Разрешённые теги в body: <p>, <h3>, <strong>, <em>, <blockquote>, <br>.
+  – Категория публикации (dropdown), по умолчанию “Lifestyle”.
+  – Ограничения по изображениям: min width/height; 16:9 crop toggle; “skip if < min”.
+  – Анти‑дубли: URL, Title similarity, Embedding similarity (вкл по умолчанию).
+  – Attribution footer (вкл/выкл).
+  – Кнопки: “Run now”, “Purge logs”, “Download logs (zip)”.
+
+WP‑Cron:
+  – Событие `moodbooster_autopub_run` по выбранной периодичности.
+  – Исключи дубликаты через `wp_next_scheduled()`.
+  – Активация плагина: планировать; деактивация: снимать.
+
+Админ‑лог (Tools → “Moodbooster Logs”):
+  – WP_List_Table с колонками: Timestamp, Source, Action (fetch/plan/write/publish), Post ID/URL, Level (INFO/WARN/ERROR), Message.
+  – Фильтры (дата/уровень/источник), пагинация, экспорт ZIP, очистка старше N дней.
+  – Хранение: файлы `wp-content/uploads/moodbooster-autopub/logs/YYYY-MM-DD.log` + cache последних N строк в transient.
+
+--------------------------------------------------------------------
+7) WP‑CLI
+--------------------------------------------------------------------
+Команды:
+  wp mb:plan
+  wp mb:run --limit=5 --source=elle
+  wp mb:rehash-images --post=ID
+
+--------------------------------------------------------------------
+8) КАЧЕСТВО И БЕЗОПАСНОСТЬ
+--------------------------------------------------------------------
+• Title‑blocklist (настраиваемый список запрещённых слов).
+• Вставлять <h3> каждые 3–5 абзацев.
+• Удалять ссылки внутри body (требование).
+• Если body_html < 1200 символов или JSON невалиден — помечать как draft/needs_review и показывать admin notice.
+• Авторизация публикации/REST: предпочтительно Application Passwords при внешних вызовах (если они будут).
+• Все поля Settings API — санитизировать/валидировать. Все действия в админке — с nonce.
+• Логи писать с указанием HTTP‑кодов и URL, а для медиа — исходный URL и результат media_sideload_image().
+
+--------------------------------------------------------------------
+9) МИНИ СТАБЫ (СОЗДАЙ РАБОЧИЕ КЛАССЫ ПО ЭТИМ СХЕМАМ)
+--------------------------------------------------------------------
+# moodbooster-autopublisher.php
+/**
+ * Plugin Name: Moodbooster Autopublisher
+ * Description: Ingests sources, translates to Slovak, picks image, dedups, and publishes.
+ * Version: 1.0.0
+ * Author: Moodbooster
+ * Text Domain: moodbooster-autopub
+ */
+declare(strict_types=1);
+namespace Moodbooster\AutoPub;
+if (!defined('ABSPATH')) exit;
+register_activation_hook(__FILE__, function(){ \Moodbooster\AutoPub\Run\Scheduler::activate(); });
+register_deactivation_hook(__FILE__, function(){ \Moodbooster\AutoPub\Run\Scheduler::deactivate(); });
+add_action('admin_menu', function(){ (new Admin\SettingsPage())->register(); });
+add_action('admin_init', function(){ (new Admin\SettingsPage())->register_settings(); });
+add_action('moodbooster_autopub_run', function(){ (new Run\Scheduler())->run_batch(); });
+if (defined('WP_CLI') && WP_CLI) { \WP_CLI::add_command('mb', Run\Cli::class); }
+
+# src/Run/Scheduler.php (скелет)
+namespace Moodbooster\AutoPub\Run;
+class Scheduler {
+  public static function activate(): void {
+    $recurrence = get_option('mb_autopub_cadence', 'daily');
+    if (!wp_next_scheduled('moodbooster_autopub_run')) {
+      wp_schedule_event(time()+60, $recurrence, 'moodbooster_autopub_run');
+    }
+  }
+  public static function deactivate(): void {
+    if ($ts = wp_next_scheduled('moodbooster_autopub_run')) wp_unschedule_event($ts, 'moodbooster_autopub_run');
+  }
+  public function run_batch(): void {
+    // Читать настройки, цикл по источникам, прогон: Planner->Writer->Editor->Images->Publisher
+  }
+}
+
+# src/Admin/SettingsPage.php (скелет)
+namespace Moodbooster\AutoPub\Admin;
+class SettingsPage {
+  const OPT = 'mb_autopub_opts';
+  public function register(): void {
+    add_options_page('Moodbooster Autopublisher','Moodbooster Autopublisher','manage_options','mb-autopub',[$this,'render']);
+  }
+  public function register_settings(): void {
+    register_setting(self::OPT, self::OPT, ['sanitize_callback'=>[$this,'sanitize']]);
+    add_settings_section('mb_main','Main','__return_false','mb-autopub');
+    add_settings_field('api_key','OpenAI API Key',[$this,'field_api_key'],'mb-autopub','mb_main');
+    // Добавь поля: источники, cadence (hourly/twicedaily/daily), publish_mode, max_per_run, image rules, log retention, кнопки
+  }
+  public function sanitize($in){ return is_array($in)? $in : []; }
+  public function render(): void {
+    echo '<div class="wrap"><h1>Moodbooster Autopublisher</h1><form method="post" action="options.php">';
+    settings_fields(self::OPT); do_settings_sections('mb-autopub'); submit_button(); echo '</form></div>';
+  }
+  public function field_api_key(): void {
+    $o = get_option(self::OPT, []);
+    printf('<input type="password" name="%s[api_key]" value="%s" class="regular-text" />', self::OPT, esc_attr($o['api_key'] ?? ''));
+  }
+}
+
+--------------------------------------------------------------------
+10) ПРИНЯТЬ РЕШЕНИЯ ПО УМОЛЧАНИЮ (чтобы плагин был «готов из коробки»)
+--------------------------------------------------------------------
+• По умолчанию включить: EuropaWire, Elle Polska, FashionPost.pl; остальное — выключено (можно включить).
+• Режим публикации: draft.
+• Периодичность: daily.
+• Лимит за прогон: 3 поста.
+• Минимальный размер изображения: 1200×675; ресайз до 16:9 включён.
+• Анти‑дубли: включены все три метода (URL, title, embeddings).
+• Атрибуция внизу поста: выключена (можно включить).
+
+--------------------------------------------------------------------
+11) ССЫЛКИ ДЛЯ ИНЖЕНЕРА (не обязательно в коде, но полезно)
+--------------------------------------------------------------------
+• OpenAI Responses API — Structured Outputs (JSON Schema, Responses): https://platform.openai.com/docs/guides/structured-outputs
+• OpenAI Responses API (reference): https://platform.openai.com/docs/api-reference/responses
+• WordPress Settings API (Plugin Handbook): https://developer.wordpress.org/plugins/settings/settings-api/
+• WordPress REST API — Posts endpoint: https://developer.wordpress.org/rest-api/reference/posts/
+• WP‑Cron: wp_schedule_event(): https://developer.wordpress.org/reference/functions/wp_schedule_event/
+• WP_List_Table (админ-таблицы): https://developer.wordpress.org/reference/classes/wp_list_table/
+• Прикрепление изображений: media_sideload_image(): https://developer.wordpress.org/reference/functions/media_sideload_image/
+
+КОНЕЦ ПРОМПТА — СОЗДАЙ ПЛАГИН СООТВЕТСТВЕННО ВСЕМ ТРЕБОВАНИЯМ ВЫШЕ.
