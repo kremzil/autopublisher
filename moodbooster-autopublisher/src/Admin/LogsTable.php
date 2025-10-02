@@ -3,6 +3,8 @@ declare(strict_types=1);
 
 namespace Moodbooster\AutoPub\Admin;
 
+use Moodbooster\AutoPub\Util\Log;
+
 if (!class_exists('\\WP_List_Table')) {
     require_once ABSPATH . 'wp-admin/includes/class-wp-list-table.php';
 }
@@ -18,6 +20,7 @@ final class LogsTable extends \WP_List_Table
 
     public static function register_page(): void
     {
+        add_action('admin_post_mb_autopub_clear_logs', [self::class, 'handle_clear_logs']);
         add_management_page(
             __('Moodbooster Logs', 'moodbooster-autopub'),
             __('Moodbooster Logs', 'moodbooster-autopub'),
@@ -34,6 +37,32 @@ final class LogsTable extends \WP_List_Table
 
         echo '<div class="wrap">';
         echo '<h1>' . esc_html__('Moodbooster Logs', 'moodbooster-autopub') . '</h1>';
+        $notice = isset($_GET['mb_autopub_logs_notice']) ? sanitize_text_field((string) $_GET['mb_autopub_logs_notice']) : '';
+        if ($notice !== '') {
+            $messages = [
+                'cleared' => __('Logs cleared.', 'moodbooster-autopub'),
+                'clear_failed' => __('Unable to clear logs.', 'moodbooster-autopub'),
+            ];
+            $message = $messages[$notice] ?? '';
+            if ($message !== '') {
+                $class = $notice === 'cleared' ? 'notice notice-success is-dismissible' : 'notice notice-error';
+                echo '<div class="' . esc_attr($class) . '"><p>' . esc_html($message) . '</p></div>';
+            }
+        }
+
+        $recent = Log::recent();
+        echo '<h2>' . esc_html__('Recent entries', 'moodbooster-autopub') . '</h2>';
+        if ($recent !== []) {
+            echo '<textarea class="widefat mb-log-view" rows="10" readonly>' . esc_textarea(implode("\n", $recent)) . '</textarea>';
+        } else {
+            echo '<p>' . esc_html__('No log entries recorded yet.', 'moodbooster-autopub') . '</p>';
+        }
+
+        echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" class="mb-log-clear">';
+        echo '<input type="hidden" name="action" value="mb_autopub_clear_logs" />';
+        echo '<input type="hidden" name="_wpnonce" value="' . esc_attr(wp_create_nonce('mb_autopub_clear_logs')) . '" />';
+        submit_button(__('Clear log', 'moodbooster-autopub'), 'secondary', 'submit', false);
+        echo '</form>';
         echo '<form method="get">';
         echo '<input type="hidden" name="page" value="mb-autopub-logs" />';
         foreach (['level', 'source', 'log_date'] as $keep) {
@@ -46,6 +75,27 @@ final class LogsTable extends \WP_List_Table
         echo '</div>';
     }
 
+    public static function handle_clear_logs(): void
+    {
+        check_admin_referer('mb_autopub_clear_logs');
+
+        if (!current_user_can('manage_options')) {
+            wp_die(__('Unauthorized', 'moodbooster-autopub'));
+        }
+
+        $result = Log::clearAll();
+        if ($result) {
+            Log::info('admin', 'clear_logs', 'All log files cleared');
+        }
+
+        $notice = $result ? 'cleared' : 'clear_failed';
+        wp_safe_redirect(add_query_arg(
+            'mb_autopub_logs_notice',
+            $notice,
+            admin_url('tools.php?page=mb-autopub-logs')
+        ));
+        exit;
+    }
     public function __construct()
     {
         parent::__construct([

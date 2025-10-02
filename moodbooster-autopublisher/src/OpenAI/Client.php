@@ -1,4 +1,4 @@
-﻿<?php
+<?php
 declare(strict_types=1);
 
 namespace Moodbooster\AutoPub\OpenAI;
@@ -42,14 +42,18 @@ final class Client
         $schemaName = isset($schema['name']) ? (string) $schema['name'] : 'ArticlePlan';
         $schemaStrict = array_key_exists('strict', $schema) ? (bool) $schema['strict'] : true;
 
+        if (!is_array($schemaBody)) {
+            return new WP_Error('mb_openai_schema', __('Invalid JSON schema payload', 'moodbooster-autopub'));
+        }
+
+        $schemaBody = $this->lockdownSchema($schemaBody);
+
         $text = [
             'format' => [
                 'type' => 'json_schema',
-                'json_schema' => [
-                    'name' => $schemaName,
-                    'schema' => $schemaBody,
-                    'strict' => $schemaStrict,
-                ],
+                'name' => $schemaName,
+                'schema' => $schemaBody,
+                'strict' => $schemaStrict,
             ],
         ];
 
@@ -128,5 +132,73 @@ final class Client
         }
 
         return $final;
+    }
+
+    /**
+     * @param array<string, mixed> $schema
+     * @return array<string, mixed>
+     */
+    private function lockdownSchema(array $schema): array
+    {
+        if (array_key_exists('uniqueItems', $schema)) {
+            unset($schema['uniqueItems']);
+        }
+
+        if (array_key_exists('format', $schema)) {
+            unset($schema['format']);
+        }
+
+        $type = $schema['type'] ?? null;
+        $hasProperties = isset($schema['properties']) && is_array($schema['properties']);
+
+        if ($type === 'object' || $hasProperties) {
+            if ($type === null) {
+                $schema['type'] = 'object';
+            }
+
+            if (!array_key_exists('additionalProperties', $schema)) {
+                $schema['additionalProperties'] = false;
+            }
+
+            if ($hasProperties) {
+                foreach ($schema['properties'] as $key => $property) {
+                    if (is_array($property)) {
+                        $schema['properties'][$key] = $this->lockdownSchema($property);
+                    }
+                }
+
+                $schema['required'] = array_values(array_keys($schema['properties']));
+            }
+
+            foreach (['patternProperties', 'definitions', '$defs'] as $bucket) {
+                if (!empty($schema[$bucket]) && is_array($schema[$bucket])) {
+                    foreach ($schema[$bucket] as $key => $definition) {
+                        if (is_array($definition)) {
+                            $schema[$bucket][$key] = $this->lockdownSchema($definition);
+                        }
+                    }
+                }
+            }
+
+            if (isset($schema['additionalProperties']) && is_array($schema['additionalProperties'])) {
+                $schema['additionalProperties'] = $this->lockdownSchema($schema['additionalProperties']);
+            }
+        }
+
+        if (isset($schema['items']) && is_array($schema['items'])) {
+            $schema['items'] = $this->lockdownSchema($schema['items']);
+        }
+
+        foreach (['anyOf', 'oneOf', 'allOf'] as $keyword) {
+            if (!empty($schema[$keyword]) && is_array($schema[$keyword])) {
+                foreach ($schema[$keyword] as $index => $subSchema) {
+                    if (is_array($subSchema)) {
+                        $schema[$keyword][$index] = $this->lockdownSchema($subSchema);
+                    }
+                }
+            }
+        }
+
+        return $schema;
     }
 }

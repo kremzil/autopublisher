@@ -1,4 +1,4 @@
-﻿.moodbooster-autopub .mb-actions {
+.moodbooster-autopub .mb-actions {
     display: flex;
     gap: 12px;
     align-items: center;
@@ -11,3 +11,14 @@
 .moodbooster-autopub .mb-settings table.form-table th {
     width: 220px;
 }
+
+.mb-log-view {
+    font-family: Menlo, Monaco, monospace;
+    height: 220px;
+    margin-bottom: 12px;
+}
+
+.mb-log-clear {
+    margin-bottom: 16px;
+}
+

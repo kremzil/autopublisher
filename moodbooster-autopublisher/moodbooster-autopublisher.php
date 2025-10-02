@@ -110,6 +110,7 @@ if (!defined('MB_PLUGIN_URL')) {
 \add_action('admin_post_mb_autopub_run_now', [SettingsPage::class, 'handle_run_now']);
 \add_action('admin_post_mb_autopub_purge_logs', [SettingsPage::class, 'handle_purge_logs']);
 \add_action('admin_post_mb_autopub_download_logs', [SettingsPage::class, 'handle_download_logs']);
+\add_action('admin_post_mb_autopub_clear_logs', [LogsTable::class, 'handle_clear_logs']);
 
 /**
  * WP-CLI команда

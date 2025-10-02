@@ -13,7 +13,7 @@ final class Planner
         '$schema' => 'https://json-schema.org/draft/2020-12/schema',
         'title' => 'PlannerOutput',
         'type' => 'object',
-        'required' => ['topic', 'why_now', 'intent', 'outline', 'internal_links', 'image_subject'],
+        'required' => ['topic', 'why_now', 'intent', 'audience', 'outline', 'internal_links', 'update_target_url', 'tags', 'image_subject', 'entity_type'],
         'properties' => [
             'topic' => ['type' => 'string', 'minLength' => 8, 'maxLength' => 140],
             'why_now' => ['type' => 'string', 'minLength' => 20, 'maxLength' => 400],
@@ -38,9 +38,8 @@ final class Planner
             ],
             'internal_links' => [
                 'type' => 'array',
-                'uniqueItems' => true,
                 'minItems' => 1,
-                'items' => ['type' => 'string', 'format' => 'uri'],
+                'items' => ['type' => 'string'],
             ],
             'update_target_url' => ['type' => 'string', 'format' => 'uri'],
             'tags' => [
@@ -97,6 +96,15 @@ final class Planner
             return $response;
         }
 
+        if (!empty($response['internal_links']) && is_array($response['internal_links'])) {
+            $links = array_map('strval', $response['internal_links']);
+            $links = array_unique($links);
+            $links = array_values(array_filter($links, static fn($url) => filter_var($url, FILTER_VALIDATE_URL)));
+            $response['internal_links'] = $links;
+        }
+
         return $response;
     }
 }
+
+

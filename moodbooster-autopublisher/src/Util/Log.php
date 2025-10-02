@@ -113,6 +113,31 @@ final class Log
         }
     }
 
+    public static function clearAll(): bool
+    {
+        $dir = self::logDir();
+        $ok = true;
+
+        if (is_dir($dir)) {
+            $entries = scandir($dir);
+            if ($entries !== false) {
+                foreach ($entries as $entry) {
+                    if ($entry === '.' || $entry === '..') {
+                        continue;
+                    }
+                    $path = $dir . '/' . $entry;
+                    if (is_file($path) && !unlink($path)) {
+                        $ok = false;
+                    }
+                }
+            }
+        }
+
+        delete_transient(self::TRANSIENT_KEY);
+
+        return $ok;
+    }
+
     private static function cacheRecent(string $line): void
     {
         $lines = get_transient(self::TRANSIENT_KEY);
