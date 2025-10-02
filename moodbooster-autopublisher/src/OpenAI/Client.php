@@ -38,35 +38,37 @@ final class Client
             return new WP_Error('mb_no_api_key', __('OpenAI API key is missing', 'moodbooster-autopub'));
         }
 
-        $format = [
-            'type'   => 'json_schema',
-            'name'   => isset($schema['name']) ? (string) $schema['name'] : 'ArticlePlan',
-            'schema' => isset($schema['schema']) ? $schema['schema'] : $schema,
-        ];
+        $schemaBody = isset($schema['schema']) ? $schema['schema'] : $schema;
+        $schemaName = isset($schema['name']) ? (string) $schema['name'] : 'ArticlePlan';
+        $schemaStrict = array_key_exists('strict', $schema) ? (bool) $schema['strict'] : true;
 
-        if (array_key_exists('strict', $schema)) {
-            $format['strict'] = (bool) $schema['strict'];
-        } else {
-            $format['strict'] = true;
-        }
-
-        $body = [
-            'model'       => $model,
-            'input'       => $input,
-            'temperature' => $temperature,
-            'text'        => [
-                'format' => $format,
+        $text = [
+            'format' => [
+                'type' => 'json_schema',
+                'json_schema' => [
+                    'name' => $schemaName,
+                    'schema' => $schemaBody,
+                    'strict' => $schemaStrict,
+                ],
             ],
         ];
 
+        $body = [
+            'model' => $model,
+            'input' => $input,
+            'temperature' => $temperature,
+            'text' => $text,
+        ];
+
         $json = wp_json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        Log::info('openai', 'structured_request', 'Payload', ['body' => $json]);
 
         $response = $this->http->request('POST', self::ENDPOINT, [
             'headers' => [
                 'Authorization' => 'Bearer ' . $this->apiKey,
-                'Content-Type'  => 'application/json',
+                'Content-Type' => 'application/json',
             ],
-            'body'    => $json,
+            'body' => $json,
             'timeout' => 60,
         ]);
 
@@ -75,7 +77,7 @@ final class Client
         }
 
         $code = (int) wp_remote_retrieve_response_code($response);
-        $raw  = wp_remote_retrieve_body($response);
+        $raw = wp_remote_retrieve_body($response);
 
         if ($code >= 400) {
             Log::error('openai', 'structured', 'API error', ['code' => $code, 'body' => $raw]);
@@ -88,7 +90,7 @@ final class Client
             return new WP_Error('mb_openai_json', __('Invalid JSON from OpenAI', 'moodbooster-autopub'));
         }
 
-        $final  = [];
+        $final = [];
         $output = $decoded['output'] ?? null;
         if (is_array($output)) {
             foreach ($output as $item) {
