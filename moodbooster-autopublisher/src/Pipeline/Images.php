@@ -20,34 +20,37 @@ final class Images
     /**
      * @param array<string, mixed> $item
      * @param array<string, mixed> $options
+     * @param array<string, mixed> $context
      * @return array<string, mixed>|WP_Error
      */
-    public function pick(array $item, array $options, string $contentHtml)
+    public function pick(array $item, array $options, string $contentHtml, array $context = [])
     {
-        $candidates = [];
-        if (!empty($item['image_url'])) {
-            $candidates[] = $item['image_url'];
-        }
-
-        $extracted = ContentExtractor::extract($contentHtml, $item['url'] ?? null);
-        if (!empty($extracted['image'])) {
-            $candidates[] = $extracted['image'];
-        }
-
-        $candidates = array_values(array_unique(array_filter($candidates)));
+        $candidates = $this->buildCandidates($item, $contentHtml, $context);
         if ($candidates === []) {
-            return new WP_Error('mb_no_image', __('No image candidates found', 'moodbooster-autopub'));
+            $error = new WP_Error('mb_no_image', __('No image candidates found', 'moodbooster-autopub'));
+            $error->add_data(['candidates' => []], 'mb_no_image');
+
+            return $error;
         }
 
         require_once ABSPATH . 'wp-admin/includes/file.php';
         require_once ABSPATH . 'wp-admin/includes/media.php';
         require_once ABSPATH . 'wp-admin/includes/image.php';
 
-        foreach ($candidates as $url) {
+        $attempted = [];
+        foreach ($candidates as $candidate) {
+            $url = (string) ($candidate['url'] ?? '');
+            if ($url === '') {
+                continue;
+            }
+
             $existing = $this->findExistingAttachment($url);
             if ($existing) {
                 $meta = wp_get_attachment_metadata($existing);
                 if (is_array($meta)) {
+                    $candidate['result'] = 'reused';
+                    $attempted[] = $candidate;
+
                     return [
                         'attachment_id' => $existing,
                         'source_url' => $url,
@@ -55,22 +58,39 @@ final class Images
                         'height' => $meta['height'] ?? 0,
                         'reused' => true,
                         'force_ratio' => !empty($options['image_force_ratio']),
+                        'selection' => $candidate,
+                        'candidates' => $this->candidateReport($attempted, $candidates),
                     ];
                 }
             }
 
             $prepared = $this->downloadCandidate($url, $options);
             if (!is_wp_error($prepared)) {
+                $candidate['result'] = 'downloaded';
+                $attempted[] = $candidate;
+
+                $prepared['selection'] = $candidate;
+                $prepared['candidates'] = $this->candidateReport($attempted, $candidates);
+
                 return $prepared;
             }
 
+            $candidate['result'] = 'skipped';
+            $candidate['download_error'] = $prepared instanceof WP_Error ? $prepared->get_error_message() : 'unknown';
+            $attempted[] = $candidate;
+
             Log::warn('images', 'candidate', 'Skipping image candidate', [
                 'url' => $url,
+                'score' => $candidate['score'] ?? 0,
+                'reasons' => $candidate['reasons'] ?? [],
                 'reason' => $prepared instanceof WP_Error ? $prepared->get_error_message() : 'unknown',
             ]);
         }
 
-        return new WP_Error('mb_image_failed', __('Unable to download a valid image', 'moodbooster-autopub'));
+        $error = new WP_Error('mb_image_failed', __('Unable to download a valid image', 'moodbooster-autopub'));
+        $error->add_data(['candidates' => $this->candidateReport($attempted, $candidates)], 'mb_image_failed');
+
+        return $error;
     }
 
     /**
@@ -85,6 +105,12 @@ final class Images
 
         if (!empty($prepared['attachment_id'])) {
             $attachmentId = (int) $prepared['attachment_id'];
+            if (!empty($prepared['source_url'])) {
+                update_post_meta($attachmentId, '_mb_image_source_url', esc_url_raw($prepared['source_url']));
+            }
+            if (!empty($prepared['selection']) && is_array($prepared['selection'])) {
+                update_post_meta($attachmentId, '_mb_image_selection', wp_json_encode($prepared['selection'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+            }
             if ($attachmentId > 0 && $postId > 0) {
                 wp_update_post([
                     'ID' => $attachmentId,
@@ -119,6 +145,9 @@ final class Images
         }
 
         update_post_meta($attachmentId, '_mb_image_source_url', esc_url_raw($prepared['source_url']));
+        if (!empty($prepared['selection']) && is_array($prepared['selection'])) {
+            update_post_meta($attachmentId, '_mb_image_selection', wp_json_encode($prepared['selection'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        }
         $this->ensureRatio($attachmentId, !empty($prepared['force_ratio']));
         set_post_thumbnail($postId, $attachmentId);
 
@@ -127,6 +156,280 @@ final class Images
         }
 
         return $attachmentId;
+    }
+
+    /**
+     * @param array<string, mixed> $item
+     * @param array<string, mixed> $context
+     * @return array<int, array<string, mixed>>
+     */
+    private function buildCandidates(array $item, string $contentHtml, array $context): array
+    {
+        $raw = [];
+        if (!empty($item['image_url'])) {
+            $raw[] = [
+                'url' => esc_url_raw((string) $item['image_url']),
+                'source' => 'rss_image',
+                'alt' => '',
+                'title' => '',
+                'class' => '',
+                'width' => 0,
+                'height' => 0,
+                'position' => 0,
+            ];
+        }
+
+        foreach (ContentExtractor::imageCandidates($contentHtml, $item['url'] ?? null) as $candidate) {
+            $raw[] = $candidate;
+        }
+
+        $terms = $this->contextTerms($item, $context);
+        $seen = [];
+        $scored = [];
+        foreach ($raw as $candidate) {
+            $url = (string) ($candidate['url'] ?? '');
+            if ($url === '') {
+                continue;
+            }
+
+            $key = $this->candidateKey($url);
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+
+            $scoredCandidate = $this->scoreCandidate($candidate, $terms);
+            if (!empty($scoredCandidate['skip'])) {
+                Log::info('images', 'candidate', 'Dropping weak image candidate', [
+                    'url' => $url,
+                    'reasons' => $scoredCandidate['reasons'] ?? [],
+                ]);
+                continue;
+            }
+
+            $scored[] = $scoredCandidate;
+        }
+
+        usort($scored, static function (array $a, array $b): int {
+            $scoreA = (int) ($a['score'] ?? 0);
+            $scoreB = (int) ($b['score'] ?? 0);
+            if ($scoreA === $scoreB) {
+                return (int) ($a['position'] ?? 0) <=> (int) ($b['position'] ?? 0);
+            }
+
+            return $scoreB <=> $scoreA;
+        });
+
+        return $scored;
+    }
+
+    /**
+     * @param array<string, mixed> $candidate
+     * @param array<int, string> $terms
+     * @return array<string, mixed>
+     */
+    private function scoreCandidate(array $candidate, array $terms): array
+    {
+        $score = 0;
+        $reasons = [];
+        $url = (string) ($candidate['url'] ?? '');
+        $source = (string) ($candidate['source'] ?? 'unknown');
+        $searchText = $this->normalizeSearchText(implode(' ', [
+            $url,
+            (string) ($candidate['alt'] ?? ''),
+            (string) ($candidate['title'] ?? ''),
+            (string) ($candidate['class'] ?? ''),
+        ]));
+
+        if ($this->unsupportedImageUrl($url)) {
+            $candidate['skip'] = true;
+            $candidate['score'] = -1000;
+            $candidate['reasons'] = ['unsupported_url'];
+
+            return $candidate;
+        }
+
+        $sourceWeights = [
+            'rss_image' => 36,
+            'og_image' => 32,
+            'twitter_image' => 28,
+            'content_img' => 24,
+            'html_img' => 8,
+            'meta_image' => 20,
+        ];
+        $sourceScore = $sourceWeights[$source] ?? 8;
+        $score += $sourceScore;
+        $reasons[] = $source;
+
+        $position = max(0, (int) ($candidate['position'] ?? 0));
+        $positionScore = max(0, 18 - min(18, $position));
+        if ($positionScore > 0) {
+            $score += $positionScore;
+            $reasons[] = 'early_position';
+        }
+
+        $width = (int) ($candidate['width'] ?? 0);
+        $height = (int) ($candidate['height'] ?? 0);
+        if ($width > 0 && $height > 0) {
+            if ($width <= 4 || $height <= 4) {
+                $candidate['skip'] = true;
+                $candidate['score'] = -1000;
+                $candidate['reasons'] = ['tracking_pixel'];
+
+                return $candidate;
+            }
+
+            if ($width >= 1200 && $height >= 675) {
+                $score += 18;
+                $reasons[] = 'declared_large';
+            } elseif ($width >= 600 && $height >= 300) {
+                $score += 10;
+                $reasons[] = 'declared_medium';
+            } elseif ($width < 240 || $height < 160) {
+                $score -= 32;
+                $reasons[] = 'penalty_small_declared';
+            }
+
+            $ratio = $width / max(1, $height);
+            if ($ratio >= 1.2 && $ratio <= 2.2) {
+                $score += 6;
+                $reasons[] = 'news_ratio';
+            }
+            if (abs($ratio - (16 / 9)) < 0.2) {
+                $score += 5;
+                $reasons[] = 'near_16_9';
+            }
+        }
+
+        $hardDropTerms = ['favicon', 'sprite', 'spacer', 'tracking', 'pixel', 'placeholder', 'avatar'];
+        foreach ($hardDropTerms as $term) {
+            if (strpos($searchText, $term) !== false) {
+                $candidate['skip'] = true;
+                $candidate['score'] = -1000;
+                $candidate['reasons'] = ['drop_' . $term];
+
+                return $candidate;
+            }
+        }
+
+        $penaltyTerms = ['logo', 'icon', 'author', 'profile', 'thumbnail', 'thumb', 'badge', 'share', 'social', 'advert', 'banner', 'promo'];
+        foreach ($penaltyTerms as $term) {
+            if (strpos($searchText, $term) !== false) {
+                $score -= ($term === 'thumbnail' || $term === 'thumb') ? 24 : 16;
+                $reasons[] = 'penalty_' . $term;
+            }
+        }
+
+        $matches = 0;
+        foreach ($terms as $term) {
+            if ($term !== '' && strpos($searchText, $term) !== false) {
+                $matches++;
+            }
+        }
+        if ($matches > 0) {
+            $score += min(24, $matches * 4);
+            $reasons[] = 'matched_terms_' . $matches;
+        }
+
+        $candidate['score'] = $score;
+        $candidate['reasons'] = array_values(array_unique($reasons));
+
+        return $candidate;
+    }
+
+    /**
+     * @param array<string, mixed> $item
+     * @param array<string, mixed> $context
+     * @return array<int, string>
+     */
+    private function contextTerms(array $item, array $context): array
+    {
+        $texts = [
+            (string) ($item['title'] ?? ''),
+            (string) ($item['source_title'] ?? ''),
+        ];
+
+        foreach (['plan', 'draft', 'headline', 'brief'] as $key) {
+            if (empty($context[$key]) || !is_array($context[$key])) {
+                continue;
+            }
+
+            foreach (['image_subject', 'headline', 'title', 'seo_title', 'image_caption', 'main_event', 'where', 'who'] as $field) {
+                if (!empty($context[$key][$field]) && is_scalar($context[$key][$field])) {
+                    $texts[] = (string) $context[$key][$field];
+                }
+            }
+        }
+
+        $normalized = $this->normalizeSearchText(implode(' ', $texts));
+        $parts = preg_split('/[^a-z0-9]+/i', $normalized) ?: [];
+        $terms = [];
+        foreach ($parts as $part) {
+            $part = trim($part);
+            if (strlen($part) < 4 || is_numeric($part)) {
+                continue;
+            }
+            $terms[$part] = true;
+            if (count($terms) >= 16) {
+                break;
+            }
+        }
+
+        return array_keys($terms);
+    }
+
+    private function normalizeSearchText(string $text): string
+    {
+        $text = wp_strip_all_tags($text);
+        if (function_exists('remove_accents')) {
+            $text = remove_accents($text);
+        }
+
+        return strtolower($text);
+    }
+
+    private function unsupportedImageUrl(string $url): bool
+    {
+        $normalized = strtolower(trim($url));
+        if ($normalized === '' || strpos($normalized, 'data:') === 0 || strpos($normalized, 'blob:') === 0) {
+            return true;
+        }
+
+        $path = strtolower((string) parse_url($normalized, PHP_URL_PATH));
+        foreach (['.svg', '.gif', '.ico'] as $extension) {
+            if (substr($path, -strlen($extension)) === $extension) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function candidateKey(string $url): string
+    {
+        return strtolower(strtok($url, '#') ?: $url);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $attempted
+     * @param array<int, array<string, mixed>> $all
+     * @return array<int, array<string, mixed>>
+     */
+    private function candidateReport(array $attempted, array $all): array
+    {
+        $byKey = [];
+        foreach ($attempted as $candidate) {
+            $byKey[$this->candidateKey((string) ($candidate['url'] ?? ''))] = $candidate;
+        }
+
+        foreach ($all as $candidate) {
+            $key = $this->candidateKey((string) ($candidate['url'] ?? ''));
+            if (!isset($byKey[$key])) {
+                $byKey[$key] = $candidate;
+            }
+        }
+
+        return array_slice(array_values($byKey), 0, 20);
     }
 
     /**

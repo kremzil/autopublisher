@@ -14,16 +14,7 @@ final class Writer
         '$schema' => 'https://json-schema.org/draft/2020-12/schema',
         'title' => 'WriterOutput',
         'type' => 'object',
-        'required' => ['title_variants', 'body_html', 'excerpt', 'tags', 'internal_links', 'image_caption'],
         'properties' => [
-            'title_variants' => [
-                'type' => 'array',
-                'minItems' => 5,
-                'maxItems' => 7,
-                'items' => ['type' => 'string', 'minLength' => 8, 'maxLength' => 70],
-            ],
-            'seo_title' => ['type' => 'string', 'minLength' => 10, 'maxLength' => 60],
-            'seo_description' => ['type' => 'string', 'minLength' => 50, 'maxLength' => 160],
             'body_html' => ['type' => 'string', 'minLength' => 1200, 'description' => 'Only allow <p>, <h3>, <strong>, <em>, <blockquote>, <br>.'],
             'excerpt' => ['type' => 'string', 'minLength' => 80, 'maxLength' => 160],
             'tags' => [
@@ -61,26 +52,29 @@ final class Writer
     /**
      * @param array<string, mixed> $item
      * @param array<string, mixed> $plan
+     * @param array<string, mixed> $brief
      * @return array<string, mixed>|WP_Error
      */
-    public function write(array $item, array $plan, string $content)
+    public function write(array $item, array $brief, array $plan, string $excerpt, string $model = 'gpt-4o-mini', string $editorialStyle = '')
     {
+        $style = $editorialStyle !== '' ? "\n\nEditorial style guide: " . $editorialStyle : '';
         $input = [
             [
                 'role' => 'system',
-                'content' => __('You are a senior lifestyle editor writing in Slovak (sk_SK). Produce human-friendly articles with entity names preserved in original language and metric conversions in parentheses. Use only <p>, <h3>, <strong>, <em>, <blockquote>, <br> tags. Insert an <h3> heading every 3-5 paragraphs. Remove hyperlinks from body.', 'moodbooster-autopub'),
+                'content' => __('You are a senior lifestyle news editor writing in Slovak (sk_SK). Write a clear magazine-news article from the fact brief and editorial plan. Start with a news lead, preserve named entities, avoid tabloid tone, and do not add facts outside the brief. Use only <p>, <h3>, <strong>, <em>, <blockquote>, <br> tags. Insert an <h3> heading every 3-5 paragraphs. Remove hyperlinks from body.', 'moodbooster-autopub') . $style,
             ],
             [
                 'role' => 'user',
                 'content' => wp_json_encode([
                     'source' => $item,
+                    'fact_brief' => $brief,
                     'plan' => $plan,
-                    'content' => mb_substr($content, 0, 8000),
-                ]),
+                    'source_excerpt' => mb_substr(strip_tags($excerpt), 0, 2500),
+                ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
             ],
         ];
 
-        $response = $this->client->structured($input, self::SCHEMA, 0.2);
+        $response = $this->client->structured($input, self::SCHEMA, 0.2, $model, 'write');
         if (is_wp_error($response)) {
             Log::error('writer', 'draft', 'Writer failed', [
                 'error' => $response->get_error_message(),

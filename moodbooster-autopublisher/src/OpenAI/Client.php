@@ -32,7 +32,8 @@ final class Client
         array $input,
         array $schema,
         float $temperature = 0.1,
-        string $model = 'gpt-4o-mini'
+        string $model = 'gpt-4o-mini',
+        string $stage = 'structured'
     ) {
         if ($this->apiKey === '') {
             return new WP_Error('mb_no_api_key', __('OpenAI API key is missing', 'moodbooster-autopub'));
@@ -65,7 +66,10 @@ final class Client
         ];
 
         $json = wp_json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        Log::info('openai', 'structured_request', 'Payload', ['body' => $json]);
+        Log::info('openai', 'structured_request', 'Request prepared', [
+            'stage' => $stage,
+            'model' => $model,
+        ]);
 
         $response = $this->http->request('POST', self::ENDPOINT, [
             'headers' => [

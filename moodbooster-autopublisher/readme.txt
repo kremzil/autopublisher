@@ -2,7 +2,7 @@
 Contributors: moodbooster
 Requires at least: 6.2
 Tested up to: 6.6
-Stable tag: 1.0.0
+Stable tag: 2.0.0
 Requires PHP: 8.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -43,5 +43,8 @@ View ingestion and publication activity in **Tools → Moodbooster Logs** with f
 * `wp mb:rehash-images --post=<id>` – enforce 16:9 crop for a post's featured image.
 
 == Changelog ==
+= 2.0.0 =
+* Adds persistent v2 queue, stage artifacts, source-only fact brief/check pipeline, review dashboard, configurable model tiers, and draft-first publication.
+
 = 1.0.0 =
 * Initial release with full ingestion pipeline, admin UI, logging, and CLI tooling.

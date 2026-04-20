@@ -55,7 +55,7 @@ final class Log
         $filename = $logDir . '/' . $timestamp->format('Y-m-d') . '.log';
         $contextStr = '';
         if ($context !== []) {
-            $contextStr = '\t' . wp_json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            $contextStr = "\t" . wp_json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         }
 
         file_put_contents($filename, $line . $contextStr . PHP_EOL, FILE_APPEND | LOCK_EX);

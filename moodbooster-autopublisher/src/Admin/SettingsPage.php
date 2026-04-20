@@ -53,6 +53,11 @@ final class SettingsPage
         add_settings_section('mb_misc', __('Miscellaneous', 'moodbooster-autopub'), '__return_false', self::SLUG);
         add_settings_field('attribution_footer', __('Attribution footer', 'moodbooster-autopub'), [$this, 'field_attribution'], self::SLUG, 'mb_misc');
         add_settings_field('log_retention_days', __('Log retention (days)', 'moodbooster-autopub'), [$this, 'field_log_retention'], self::SLUG, 'mb_misc');
+
+        add_settings_section('mb_v2', __('Version 2 Pipeline', 'moodbooster-autopub'), '__return_false', self::SLUG);
+        add_settings_field('v2_models', __('OpenAI models', 'moodbooster-autopub'), [$this, 'field_v2_models'], self::SLUG, 'mb_v2');
+        add_settings_field('v2_quality', __('Quality controls', 'moodbooster-autopub'), [$this, 'field_v2_quality'], self::SLUG, 'mb_v2');
+        add_settings_field('editorial_style', __('Editorial style', 'moodbooster-autopub'), [$this, 'field_editorial_style'], self::SLUG, 'mb_v2');
     }
 
     /**
@@ -97,6 +102,15 @@ final class SettingsPage
 
         $clean['attribution_footer'] = !empty($input['attribution_footer']);
         $clean['log_retention_days'] = max(1, (int) ($input['log_retention_days'] ?? $defaults['log_retention_days']));
+        foreach (['model_brief', 'model_plan', 'model_write', 'model_check', 'model_headline'] as $modelKey) {
+            $value = isset($input[$modelKey]) ? sanitize_text_field((string) $input[$modelKey]) : '';
+            $clean[$modelKey] = $value !== '' ? $value : $defaults[$modelKey];
+        }
+        $clean['repair_enabled'] = !empty($input['repair_enabled']);
+        $clean['dashboard_per_page'] = max(10, min(200, (int) ($input['dashboard_per_page'] ?? $defaults['dashboard_per_page'])));
+        $clean['quality_threshold'] = max(0, min(1, (float) ($input['quality_threshold'] ?? $defaults['quality_threshold'])));
+        $clean['editorial_style'] = sanitize_textarea_field((string) ($input['editorial_style'] ?? $defaults['editorial_style']));
+        $clean['enable_gated_publish'] = !empty($input['enable_gated_publish']);
 
         Scheduler::maybe_reschedule($clean['cadence']);
 
@@ -156,12 +170,12 @@ final class SettingsPage
             return;
         }
 
-wp_enqueue_style(
-    'moodbooster-autopub-admin',
-    plugins_url('assets/admin.css', PLUGIN_FILE),
-    [],
-    VERSION
-);
+        wp_enqueue_style(
+            'moodbooster-autopub-admin',
+            plugins_url('assets/admin.css', PLUGIN_FILE),
+            [],
+            VERSION
+        );
     }
 
     public static function handle_run_now(): void
@@ -241,7 +255,7 @@ wp_enqueue_style(
         exit;
     }
 
-            public static function admin_notices(): void
+    public static function admin_notices(): void
     {
         if (!isset($_GET['mb_autopub_notice'])) {
             return;
@@ -263,6 +277,7 @@ wp_enqueue_style(
 
         echo '<div class="notice notice-success is-dismissible"><p>' . esc_html($message) . '</p></div>';
     }
+
     public function field_api_key(): void
     {
         $o = Settings::all();
@@ -438,6 +453,58 @@ wp_enqueue_style(
             '<input type="number" min="1" max="365" name="%1$s[log_retention_days]" value="%2$d" class="small-text" />',
             esc_attr(Settings::OPTION_KEY),
             (int) ($o['log_retention_days'] ?? 30)
+        );
+    }
+
+    public function field_v2_models(): void
+    {
+        $o = Settings::all();
+        $fields = [
+            'model_brief' => __('Fact brief', 'moodbooster-autopub'),
+            'model_plan' => __('Planner', 'moodbooster-autopub'),
+            'model_write' => __('Writer / repair', 'moodbooster-autopub'),
+            'model_check' => __('Fact check / editor', 'moodbooster-autopub'),
+            'model_headline' => __('Headline', 'moodbooster-autopub'),
+        ];
+
+        foreach ($fields as $key => $label) {
+            printf(
+                '<label>%3$s <input type="text" name="%1$s[%2$s]" value="%4$s" class="regular-text" /></label><br />',
+                esc_attr(Settings::OPTION_KEY),
+                esc_attr($key),
+                esc_html($label),
+                esc_attr($o[$key] ?? '')
+            );
+        }
+    }
+
+    public function field_v2_quality(): void
+    {
+        $o = Settings::all();
+        printf(
+            '<label><input type="checkbox" name="%1$s[repair_enabled]" value="1" %2$s /> %3$s</label><br />'
+            . '<label>%4$s <input type="number" min="10" max="200" name="%1$s[dashboard_per_page]" value="%5$d" class="small-text" /></label><br />'
+            . '<label>%6$s <input type="number" min="0" max="1" step="0.05" name="%1$s[quality_threshold]" value="%7$s" class="small-text" /></label><br />'
+            . '<label><input type="checkbox" name="%1$s[enable_gated_publish]" value="1" %8$s /> %9$s</label>',
+            esc_attr(Settings::OPTION_KEY),
+            checked(!empty($o['repair_enabled']), true, false),
+            esc_html__('Run one automatic repair when fact check fails', 'moodbooster-autopub'),
+            esc_html__('Dashboard rows', 'moodbooster-autopub'),
+            (int) ($o['dashboard_per_page'] ?? 50),
+            esc_html__('Minimum editor score', 'moodbooster-autopub'),
+            esc_attr((string) ($o['quality_threshold'] ?? 0.7)),
+            checked(!empty($o['enable_gated_publish']), true, false),
+            esc_html__('Allow gated live publishing when publish mode is enabled', 'moodbooster-autopub')
+        );
+    }
+
+    public function field_editorial_style(): void
+    {
+        $o = Settings::all();
+        printf(
+            '<textarea name="%1$s[editorial_style]" rows="4" cols="60" class="large-text code">%2$s</textarea>',
+            esc_attr(Settings::OPTION_KEY),
+            esc_textarea((string) ($o['editorial_style'] ?? ''))
         );
     }
 

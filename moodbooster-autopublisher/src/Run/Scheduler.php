@@ -7,20 +7,27 @@ use Moodbooster\AutoPub\Http\Client as HttpClient;
 use Moodbooster\AutoPub\OpenAI\Client as OpenAiClient;
 use Moodbooster\AutoPub\Pipeline\Dedup;
 use Moodbooster\AutoPub\Pipeline\Editor;
+use Moodbooster\AutoPub\Pipeline\FactBrief;
+use Moodbooster\AutoPub\Pipeline\FactCheck;
+use Moodbooster\AutoPub\Pipeline\Headline;
 use Moodbooster\AutoPub\Pipeline\Images;
 use Moodbooster\AutoPub\Pipeline\Planner;
 use Moodbooster\AutoPub\Pipeline\Publisher;
-use Moodbooster\AutoPub\Pipeline\Translate;
+use Moodbooster\AutoPub\Pipeline\Repair;
 use Moodbooster\AutoPub\Pipeline\Writer;
+use Moodbooster\AutoPub\Sources\EllePolska;
 use Moodbooster\AutoPub\Sources\EuropaWire;
 use Moodbooster\AutoPub\Sources\FashionPost;
 use Moodbooster\AutoPub\Sources\FashionStreetHU;
-use Moodbooster\AutoPub\Sources\EllePolska;
+use Moodbooster\AutoPub\Sources\LOfficielBE;
 use Moodbooster\AutoPub\Sources\MarieClaireHU;
 use Moodbooster\AutoPub\Sources\MiastoKobiet;
-use Moodbooster\AutoPub\Sources\LOfficielBE;
 use Moodbooster\AutoPub\Sources\SourceInterface;
 use Moodbooster\AutoPub\Sources\TogetherMagazineBE;
+use Moodbooster\AutoPub\Storage\ArtifactRepository;
+use Moodbooster\AutoPub\Storage\Database;
+use Moodbooster\AutoPub\Storage\QueueRepository;
+use Moodbooster\AutoPub\Storage\RunRepository;
 use Moodbooster\AutoPub\Util\ContentExtractor;
 use Moodbooster\AutoPub\Util\Log;
 use Moodbooster\AutoPub\Util\Settings;
@@ -30,6 +37,8 @@ class Scheduler
 {
     public static function activate(): void
     {
+        Database::install();
+
         $recurrence = get_option('mb_autopub_cadence', 'daily');
         if (!wp_next_scheduled('moodbooster_autopub_run')) {
             wp_schedule_event(time() + 60, $recurrence, 'moodbooster_autopub_run');
@@ -62,6 +71,22 @@ class Scheduler
      */
     public function run_batch(array $context = []): void
     {
+        $queued = $this->ingest($context);
+        $created = $this->generateQueued($context);
+
+        Log::info('scheduler', 'run', 'Run completed', [
+            'queued' => $queued,
+            'created' => $created,
+        ]);
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    public function ingest(array $context = []): int
+    {
+        Database::install();
+
         $options = Settings::all();
         $sources = array_filter($options['sources'] ?? [], static fn($enabled) => (bool) $enabled);
         if (!empty($context['source'])) {
@@ -70,103 +95,242 @@ class Scheduler
         }
 
         if ($sources === []) {
-            Log::warn('scheduler', 'run', 'No sources enabled');
+            Log::warn('scheduler', 'ingest', 'No sources enabled');
 
-            return;
+            return 0;
         }
 
         $http = new HttpClient();
-        $openAi = new OpenAiClient((string) ($options['api_key'] ?? ''), $http);
-        $planner = new Planner($openAi);
-        $writer = new Writer($openAi);
-        $editor = new Editor($openAi);
-        $translator = new Translate($openAi);
         $dedup = new Dedup();
-        $publisher = new Publisher($dedup);
-        $images = new Images($http);
-
-        $limit = isset($context['limit']) ? max(1, (int) $context['limit']) : max(1, (int) ($options['max_per_run'] ?? 3));
-        $created = 0;
+        $queue = new QueueRepository();
+        $limit = isset($context['fetch_limit']) ? max(1, (int) $context['fetch_limit']) : max(10, (int) ($options['max_per_run'] ?? 3) * 3);
+        $queued = 0;
 
         foreach (array_keys($sources) as $sourceKey) {
+            if (($options['fetch_mode'] ?? 'rss_html') === 'html_only') {
+                Log::warn($sourceKey, 'ingest', 'HTML-only discovery is not supported for this source yet');
+                continue;
+            }
+
             $source = $this->makeSource($sourceKey, $http);
             if (!$source) {
                 continue;
             }
 
-            $items = $source->fetch($limit * 2);
+            $items = $source->fetch($limit);
             foreach ($items as $item) {
-                if ($created >= $limit) {
-                    break 2;
-                }
-
                 $evaluation = $dedup->evaluate($item, $options);
-                if ($evaluation['action'] === 'skip') {
-                    continue;
-                }
-
-                if ($evaluation['action'] === 'update' && !empty($evaluation['post_id'])) {
-                    $this->runUpdateFlow((int) $evaluation['post_id'], $item, $translator);
-                    continue;
-                }
-
-                $article = $this->fetchArticle($item['url'] ?? '', $http);
-                if (!$article) {
-                    Log::warn($item['source'] ?? 'source', 'fetch', 'Unable to retrieve article body', [
+                if (($evaluation['action'] ?? '') !== 'create') {
+                    Log::info($item['source'] ?? $sourceKey, 'ingest', 'Skipping existing or related item', [
+                        'reason' => $evaluation['reason'] ?? 'dedupe',
+                        'post_id' => $evaluation['post_id'] ?? null,
                         'url' => $item['url'] ?? '',
                     ]);
                     continue;
                 }
 
-                $plan = $planner->plan($item, $article['content']);
-                if (is_wp_error($plan)) {
-                    continue;
+                $itemId = $queue->upsertItem($item);
+                if ($itemId > 0) {
+                    $queued++;
                 }
+            }
+        }
 
-                $draft = $writer->write($item, $plan, $article['content']);
-                if (is_wp_error($draft)) {
-                    continue;
-                }
+        return $queued;
+    }
 
-                $review = $editor->review($draft);
-                if (is_wp_error($review)) {
-                    continue;
-                }
+    /**
+     * @param array<string, mixed> $context
+     */
+    public function generateQueued(array $context = []): int
+    {
+        Database::install();
 
-                $imageData = null;
-                $imageResult = $images->pick($item, $options, $article['original_html']);
-                if (!is_wp_error($imageResult)) {
-                    $imageData = $imageResult;
-                } elseif (!empty($options['image_skip_under_min'])) {
-                    Log::warn($item['source'] ?? 'source', 'image', 'Skipping due to missing image', [
-                        'url' => $item['url'] ?? '',
-                    ]);
-                    continue;
-                }
+        $options = Settings::all();
+        $limit = isset($context['limit']) ? max(1, (int) $context['limit']) : max(1, (int) ($options['max_per_run'] ?? 3));
+        $source = isset($context['source']) && !is_array($context['source']) ? sanitize_key((string) $context['source']) : null;
+        $queue = new QueueRepository();
+        $items = $queue->nextQueued($limit, $source);
+        $created = 0;
 
-                $post = $publisher->publish($item, $plan, $draft, $options, $review);
-                if (is_wp_error($post)) {
-                    Log::error($item['source'] ?? 'source', 'publish', 'Failed to publish', [
-                        'error' => $post->get_error_message(),
-                    ]);
-                    continue;
-                }
-
-                if ($imageData) {
-                    $attachmentId = $images->attach($imageData, (int) $post['post_id']);
-                    if (!is_wp_error($attachmentId)) {
-                        update_post_meta((int) $post['post_id'], '_mb_image_source_url', esc_url_raw($imageData['source_url'] ?? ''));
-                    }
-                }
-
+        foreach ($items as $row) {
+            $result = $this->generateItem((int) $row['id']);
+            if (!is_wp_error($result)) {
                 $created++;
             }
         }
 
-        Log::info('scheduler', 'run', 'Run completed', [
-            'created' => $created,
-            'limit' => $limit,
+        return $created;
+    }
+
+    /**
+     * @return int|WP_Error Post ID on success.
+     */
+    public function generateItem(int $itemId)
+    {
+        Database::install();
+
+        $queue = new QueueRepository();
+        $runs = new RunRepository();
+        $artifacts = new ArtifactRepository();
+        $row = $queue->find($itemId);
+        if (!$row) {
+            return new WP_Error('mb_queue_missing', __('Queue item not found', 'moodbooster-autopub'));
+        }
+
+        $item = $queue->decodeItem($row);
+        if ($item === []) {
+            $item = [
+                'source' => $row['source'] ?? 'unknown',
+                'url' => $row['url'] ?? '',
+                'title' => $row['title'] ?? '',
+                'fingerprint' => $row['fingerprint'] ?? '',
+            ];
+        }
+
+        $options = Settings::all();
+        $models = Settings::modelMap();
+        $runId = $runs->start($itemId, $models);
+        $queue->markRunning($itemId);
+
+        try {
+            $http = new HttpClient();
+            $article = $this->fetchArticle((string) ($item['url'] ?? ''), $http);
+            if (!$article) {
+                return $this->failItem($queue, $runs, $itemId, $runId, 'Unable to retrieve article body');
+            }
+            $artifacts->save($itemId, $runId, 'source_article', [
+                'url' => $item['url'] ?? '',
+                'content' => $article['content'] ?? '',
+                'image' => $article['image'] ?? null,
+            ]);
+
+            $openAi = new OpenAiClient((string) ($options['api_key'] ?? ''), $http);
+            $briefStage = new FactBrief($openAi);
+            $planner = new Planner($openAi);
+            $writer = new Writer($openAi);
+            $factChecker = new FactCheck($openAi);
+            $repairer = new Repair($openAi);
+            $editor = new Editor($openAi);
+            $headlineStage = new Headline($openAi);
+            $publisher = new Publisher(new Dedup());
+            $images = new Images($http);
+
+            $brief = $briefStage->extract($item, (string) $article['content'], $models['brief']);
+            if (is_wp_error($brief)) {
+                return $this->failItem($queue, $runs, $itemId, $runId, $brief->get_error_message());
+            }
+            $artifacts->save($itemId, $runId, 'fact_brief', $brief);
+
+            $plan = $planner->plan($item, $brief, $this->internalLinkCandidates($item), $models['plan']);
+            if (is_wp_error($plan)) {
+                return $this->failItem($queue, $runs, $itemId, $runId, $plan->get_error_message());
+            }
+            $artifacts->save($itemId, $runId, 'plan', $plan);
+
+            $draft = $writer->write($item, $brief, $plan, (string) $article['content'], $models['write'], (string) ($options['editorial_style'] ?? ''));
+            if (is_wp_error($draft)) {
+                return $this->failItem($queue, $runs, $itemId, $runId, $draft->get_error_message());
+            }
+            $artifacts->save($itemId, $runId, 'draft', $draft);
+
+            $factcheck = $factChecker->check($item, $brief, $draft, (string) $article['content'], $models['check']);
+            if (is_wp_error($factcheck)) {
+                return $this->failItem($queue, $runs, $itemId, $runId, $factcheck->get_error_message());
+            }
+            $artifacts->save($itemId, $runId, 'factcheck', $factcheck);
+
+            if (empty($factcheck['supported']) && !empty($options['repair_enabled'])) {
+                $repaired = $repairer->repair($item, $brief, $plan, $draft, $factcheck, $models['write']);
+                if (!is_wp_error($repaired)) {
+                    $draft = $repaired;
+                    $artifacts->save($itemId, $runId, 'repair', $draft);
+                    $rechecked = $factChecker->check($item, $brief, $draft, (string) $article['content'], $models['check']);
+                    if (!is_wp_error($rechecked)) {
+                        $factcheck = $rechecked;
+                        $artifacts->save($itemId, $runId, 'factcheck', $factcheck);
+                    }
+                }
+            }
+
+            $review = $editor->review($draft, $brief, is_array($factcheck) ? $factcheck : [], $models['check']);
+            if (is_wp_error($review)) {
+                return $this->failItem($queue, $runs, $itemId, $runId, $review->get_error_message());
+            }
+            $review = $this->applyQualityThreshold($review, (float) ($options['quality_threshold'] ?? 0.7));
+            $artifacts->save($itemId, $runId, 'editor_gate', $review);
+
+            $headline = $headlineStage->generate($item, $brief, $plan, $draft, $models['headline']);
+            if (is_wp_error($headline)) {
+                return $this->failItem($queue, $runs, $itemId, $runId, $headline->get_error_message());
+            }
+            $artifacts->save($itemId, $runId, 'headline', $headline);
+
+            $post = $publisher->publish($item, $plan, $draft, $options, $review, $headline, is_array($factcheck) ? $factcheck : [], $itemId, $runId);
+            if (is_wp_error($post)) {
+                return $this->failItem($queue, $runs, $itemId, $runId, $post->get_error_message());
+            }
+
+            $imageContext = [
+                'brief' => $brief,
+                'plan' => $plan,
+                'draft' => $draft,
+                'headline' => $headline,
+            ];
+            $imageResult = $images->pick($item, $options, (string) ($article['original_html'] ?? ''), $imageContext);
+            if (!is_wp_error($imageResult)) {
+                $artifacts->save($itemId, $runId, 'image_selection', [
+                    'status' => 'selected',
+                    'source_url' => $imageResult['source_url'] ?? '',
+                    'selection' => $imageResult['selection'] ?? [],
+                    'candidates' => $imageResult['candidates'] ?? [],
+                ]);
+
+                $attachmentId = $images->attach($imageResult, (int) $post['post_id']);
+                if (!is_wp_error($attachmentId)) {
+                    update_post_meta((int) $post['post_id'], '_mb_image_source_url', esc_url_raw($imageResult['source_url'] ?? ''));
+                    if (!empty($imageResult['selection']) && is_array($imageResult['selection'])) {
+                        update_post_meta((int) $post['post_id'], '_mb_image_selection', wp_json_encode($imageResult['selection'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                    }
+                }
+            } else {
+                $imageErrorData = $imageResult->get_error_data($imageResult->get_error_code());
+                $artifacts->save($itemId, $runId, 'image_selection', [
+                    'status' => 'failed',
+                    'error' => $imageResult->get_error_message(),
+                    'candidates' => is_array($imageErrorData) ? ($imageErrorData['candidates'] ?? []) : [],
+                ]);
+            }
+
+            if (is_wp_error($imageResult) && !empty($options['image_skip_under_min'])) {
+                Log::warn($item['source'] ?? 'source', 'image', 'Draft created without valid image', [
+                    'post_id' => $post['post_id'],
+                    'url' => $item['url'] ?? '',
+                    'reason' => $imageResult->get_error_message(),
+                ]);
+            }
+
+            $needsReview = empty($review['approval']) || empty($factcheck['supported']) || !empty($factcheck['needs_human_review']);
+            $queue->markDraft($itemId, (int) $post['post_id'], $needsReview);
+            $runs->finish($runId, $needsReview ? 'needs_review' : 'success');
+
+            return (int) $post['post_id'];
+        } catch (\Throwable $e) {
+            return $this->failItem($queue, $runs, $itemId, $runId, $e->getMessage());
+        }
+    }
+
+    private function failItem(QueueRepository $queue, RunRepository $runs, int $itemId, int $runId, string $error): WP_Error
+    {
+        $queue->markFailed($itemId, $error);
+        $runs->finish($runId, 'failed', $error);
+        Log::error('scheduler', 'generate', 'Queue item failed', [
+            'item_id' => $itemId,
+            'run_id' => $runId,
+            'error' => $error,
         ]);
+
+        return new WP_Error('mb_v2_generate_failed', $error);
     }
 
     private function makeSource(string $key, HttpClient $http): ?SourceInterface
@@ -192,6 +356,10 @@ class Scheduler
                 return null;
         }
     }
+
+    /**
+     * @return array<string, mixed>|null
+     */
     private function fetchArticle(string $url, HttpClient $http): ?array
     {
         if ($url === '') {
@@ -219,32 +387,57 @@ class Scheduler
         return $extracted;
     }
 
-    private function runUpdateFlow(int $postId, array $item, Translate $translator): void
+    /**
+     * @param array<string, mixed> $review
+     * @return array<string, mixed>
+     */
+    private function applyQualityThreshold(array $review, float $threshold): array
     {
-        $summary = $item['summary'] ?? '';
-        if ($summary !== '') {
-            $translated = $translator->toSlovak($summary);
-            if (!is_wp_error($translated)) {
-                $summary = (string) $translated;
+        $scores = $review['quality_scores'] ?? [];
+        if (!is_array($scores)) {
+            return $review;
+        }
+
+        foreach (['helpful', 'originality', 'clarity'] as $key) {
+            if (isset($scores[$key]) && (float) $scores[$key] < $threshold) {
+                $review['approval'] = false;
+                $reasons = isset($review['reasons']) && is_array($review['reasons']) ? $review['reasons'] : [];
+                $reasons[] = sprintf('Quality score %s is below threshold %.2f', $key, $threshold);
+                $review['reasons'] = array_values(array_unique($reasons));
             }
         }
 
-        $block = sprintf(
-            '<p><strong>%s</strong> %s</p>',
-            esc_html__('AktualizÃƒÆ’Ã‚Â¡cia:', 'moodbooster-autopub'),
-            esc_html($summary)
-        );
+        return $review;
+    }
 
-        $current = get_post_field('post_content', $postId);
-        if ($current) {
-            wp_update_post([
-                'ID' => $postId,
-                'post_content' => $block . $current,
-            ]);
+    /**
+     * @param array<string, mixed> $item
+     * @return array<int, array{title:string,url:string,reason:string}>
+     */
+    private function internalLinkCandidates(array $item): array
+    {
+        $query = new \WP_Query([
+            'post_type' => 'post',
+            'post_status' => 'publish',
+            'posts_per_page' => 10,
+            'orderby' => 'date',
+            'order' => 'DESC',
+            'fields' => 'ids',
+        ]);
+
+        $candidates = [];
+        foreach ($query->posts as $postId) {
+            $url = get_permalink((int) $postId);
+            if (!$url || $url === ($item['url'] ?? '')) {
+                continue;
+            }
+            $candidates[] = [
+                'title' => get_the_title((int) $postId),
+                'url' => $url,
+                'reason' => 'recent_published_post',
+            ];
         }
 
-        Log::info($item['source'] ?? 'source', 'update', 'Updated existing post', [
-            'post_id' => $postId,
-        ]);
+        return $candidates;
     }
 }

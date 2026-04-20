@@ -39,6 +39,16 @@ final class Settings
             'title_blocklist' => [],
             'attribution_footer' => false,
             'log_retention_days' => 30,
+            'model_brief' => 'gpt-4o-mini',
+            'model_plan' => 'gpt-4o-mini',
+            'model_write' => 'gpt-4o-mini',
+            'model_check' => 'gpt-4o-mini',
+            'model_headline' => 'gpt-4o-mini',
+            'repair_enabled' => true,
+            'dashboard_per_page' => 50,
+            'quality_threshold' => 0.7,
+            'editorial_style' => 'Magazine news: clear Slovak lead, useful context, no tabloid claims, no unsupported inferences.',
+            'enable_gated_publish' => false,
         ];
     }
 
@@ -65,5 +75,22 @@ final class Settings
         $options = self::all();
 
         return $options[$key] ?? $default;
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public static function modelMap(): array
+    {
+        $options = self::all();
+        $defaults = self::defaults();
+
+        return [
+            'brief' => (string) ($options['model_brief'] ?: $defaults['model_brief']),
+            'plan' => (string) ($options['model_plan'] ?: $defaults['model_plan']),
+            'write' => (string) ($options['model_write'] ?: $defaults['model_write']),
+            'check' => (string) ($options['model_check'] ?: $defaults['model_check']),
+            'headline' => (string) ($options['model_headline'] ?: $defaults['model_headline']),
+        ];
     }
 }

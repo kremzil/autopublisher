@@ -3,7 +3,7 @@ declare(strict_types=1);
 /**
  * Plugin Name: Moodbooster Autopublisher
  * Description: Ingests sources, translates to Slovak, picks image, dedups, and publishes.
- * Version: 1.0.1
+ * Version: 2.0.0
  * Author: Moodbooster
  * Text Domain: moodbooster-autopub
  */
@@ -11,16 +11,18 @@ declare(strict_types=1);
 namespace Moodbooster\AutoPub;
 
 use Moodbooster\AutoPub\Admin\LogsTable;
+use Moodbooster\AutoPub\Admin\QueuePage;
 use Moodbooster\AutoPub\Admin\SettingsPage;
 use Moodbooster\AutoPub\Run\Cli;
 use Moodbooster\AutoPub\Run\Scheduler;
+use Moodbooster\AutoPub\Storage\Database;
 
 if (!defined('ABSPATH')) {
     exit;
 }
 
 // ── Константы (только константные выражения)
-const VERSION     = '1.0.1';
+const VERSION     = '2.0.0';
 const PLUGIN_FILE = __FILE__;
 const PLUGIN_PATH = __DIR__;
 const TEXT_DOMAIN = 'moodbooster-autopub';
@@ -59,6 +61,8 @@ if (!defined('MB_PLUGIN_URL')) {
  * Активация плагина (с проверкой наличия класса/метода)
  */
 \register_activation_hook(__FILE__, static function (): void {
+    Database::install();
+
     if (!\class_exists(Scheduler::class)) {
         $fallback = __DIR__ . '/src/Run/Scheduler.php';
         if (\is_file($fallback)) {
@@ -86,6 +90,7 @@ if (!defined('MB_PLUGIN_URL')) {
  */
 \add_action('admin_menu', static function (): void {
     (new SettingsPage())->register();
+    QueuePage::register_page();
     LogsTable::register_page();
 });
 
@@ -111,6 +116,7 @@ if (!defined('MB_PLUGIN_URL')) {
 \add_action('admin_post_mb_autopub_purge_logs', [SettingsPage::class, 'handle_purge_logs']);
 \add_action('admin_post_mb_autopub_download_logs', [SettingsPage::class, 'handle_download_logs']);
 \add_action('admin_post_mb_autopub_clear_logs', [LogsTable::class, 'handle_clear_logs']);
+\add_action('admin_post_mb_autopub_queue_action', [QueuePage::class, 'handle_action']);
 
 /**
  * WP-CLI команда

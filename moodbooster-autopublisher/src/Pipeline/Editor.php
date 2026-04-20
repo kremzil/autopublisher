@@ -48,20 +48,24 @@ final class Editor
      * @param array<string, mixed> $draft
      * @return array<string, mixed>|WP_Error
      */
-    public function review(array $draft)
+    public function review(array $draft, array $brief = [], array $factcheck = [], string $model = 'gpt-4o-mini')
     {
         $input = [
             [
                 'role' => 'system',
-                'content' => __('You are a quality editor ensuring the article is people-first, original, and clear. Approve only if the content is ready to publish; otherwise flag reasons. Respond with JSON only.', 'moodbooster-autopub'),
+                'content' => __('You are a quality editor ensuring the article is people-first, original, clear, and consistent with the fact check. Approve only if the content is ready for editorial use; otherwise flag reasons. Respond with JSON only.', 'moodbooster-autopub'),
             ],
             [
                 'role' => 'user',
-                'content' => wp_json_encode($draft),
+                'content' => wp_json_encode([
+                    'draft' => $draft,
+                    'fact_brief' => $brief,
+                    'factcheck' => $factcheck,
+                ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
             ],
         ];
 
-        $response = $this->client->structured($input, self::SCHEMA, 0.1);
+        $response = $this->client->structured($input, self::SCHEMA, 0.1, $model, 'editor_gate');
         if (is_wp_error($response)) {
             Log::error('editor', 'review', 'Editor review failed', [
                 'error' => $response->get_error_message(),

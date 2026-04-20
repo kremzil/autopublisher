@@ -6,6 +6,9 @@ namespace Moodbooster\AutoPub\Run;
 use Moodbooster\AutoPub\Http\Client as HttpClient;
 use Moodbooster\AutoPub\OpenAI\Client as OpenAiClient;
 use Moodbooster\AutoPub\Pipeline\Editor;
+use Moodbooster\AutoPub\Pipeline\FactBrief;
+use Moodbooster\AutoPub\Pipeline\FactCheck;
+use Moodbooster\AutoPub\Pipeline\Headline;
 use Moodbooster\AutoPub\Pipeline\Planner;
 use Moodbooster\AutoPub\Pipeline\Writer;
 use Moodbooster\AutoPub\Sources\EuropaWire;
@@ -37,9 +40,13 @@ final class Cli extends WP_CLI_Command
         $options = Settings::all();
         $http = new HttpClient();
         $openAi = new OpenAiClient((string) ($options['api_key'] ?? ''), $http);
+        $briefStage = new FactBrief($openAi);
         $planner = new Planner($openAi);
         $writer = new Writer($openAi);
+        $factChecker = new FactCheck($openAi);
         $editor = new Editor($openAi);
+        $headlineStage = new Headline($openAi);
+        $models = Settings::modelMap();
 
         $sourceKey = $assocArgs['source'] ?? null;
         $sources = array_filter($options['sources'] ?? [], static fn($enabled) => (bool) $enabled);
@@ -64,26 +71,42 @@ final class Cli extends WP_CLI_Command
                 WP_CLI::warning("Failed to fetch article body for {$item['url']}");
                 continue;
             }
-            $plan = $planner->plan($item, $article['content']);
+            $brief = $briefStage->extract($item, $article['content'], $models['brief']);
+            if (is_wp_error($brief)) {
+                WP_CLI::warning($brief->get_error_message());
+                continue;
+            }
+            $plan = $planner->plan($item, $brief, [], $models['plan']);
             if (is_wp_error($plan)) {
                 WP_CLI::warning($plan->get_error_message());
                 continue;
             }
-            $draft = $writer->write($item, $plan, $article['content']);
+            $draft = $writer->write($item, $brief, $plan, $article['content'], $models['write'], (string) ($options['editorial_style'] ?? ''));
             if (is_wp_error($draft)) {
                 WP_CLI::warning($draft->get_error_message());
                 continue;
             }
-            $review = $editor->review($draft);
+            $factcheck = $factChecker->check($item, $brief, $draft, $article['content'], $models['check']);
+            if (is_wp_error($factcheck)) {
+                WP_CLI::warning($factcheck->get_error_message());
+                continue;
+            }
+            $review = $editor->review($draft, $brief, $factcheck, $models['check']);
             if (is_wp_error($review)) {
                 WP_CLI::warning($review->get_error_message());
+                continue;
+            }
+            $headline = $headlineStage->generate($item, $brief, $plan, $draft, $models['headline']);
+            if (is_wp_error($headline)) {
+                WP_CLI::warning($headline->get_error_message());
                 continue;
             }
 
             WP_CLI::line(str_repeat('=', 40));
             WP_CLI::success("Plan for {$key}");
-            WP_CLI::line('Title suggestion: ' . ($draft['title_variants'][0] ?? 'n/a'));
+            WP_CLI::line('Headline: ' . ($headline['headline'] ?? 'n/a'));
             WP_CLI::line('Outline: ' . wp_json_encode($plan['outline'] ?? []));
+            WP_CLI::line('Fact check: ' . (!empty($factcheck['supported']) ? 'supported' : 'needs review'));
             WP_CLI::line('Editor approval: ' . (!empty($review['approval']) ? 'yes' : 'needs review'));
         }
     }
