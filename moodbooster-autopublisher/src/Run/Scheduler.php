@@ -15,13 +15,16 @@ use Moodbooster\AutoPub\Pipeline\Planner;
 use Moodbooster\AutoPub\Pipeline\Publisher;
 use Moodbooster\AutoPub\Pipeline\Repair;
 use Moodbooster\AutoPub\Pipeline\Writer;
+use Moodbooster\AutoPub\Sources\AbstractHtmlSource;
 use Moodbooster\AutoPub\Sources\EllePolska;
 use Moodbooster\AutoPub\Sources\EuropaWire;
 use Moodbooster\AutoPub\Sources\FashionPost;
 use Moodbooster\AutoPub\Sources\FashionStreetHU;
+use Moodbooster\AutoPub\Sources\BratislavskeNoviny;
 use Moodbooster\AutoPub\Sources\LOfficielBE;
 use Moodbooster\AutoPub\Sources\MarieClaireHU;
 use Moodbooster\AutoPub\Sources\MiastoKobiet;
+use Moodbooster\AutoPub\Sources\NaseKosice;
 use Moodbooster\AutoPub\Sources\SourceInterface;
 use Moodbooster\AutoPub\Sources\TogetherMagazineBE;
 use Moodbooster\AutoPub\Storage\ArtifactRepository;
@@ -29,6 +32,7 @@ use Moodbooster\AutoPub\Storage\Database;
 use Moodbooster\AutoPub\Storage\QueueRepository;
 use Moodbooster\AutoPub\Storage\RunRepository;
 use Moodbooster\AutoPub\Util\ContentExtractor;
+use Moodbooster\AutoPub\Util\Html;
 use Moodbooster\AutoPub\Util\Log;
 use Moodbooster\AutoPub\Util\Settings;
 use WP_Error;
@@ -105,19 +109,26 @@ class Scheduler
         $queue = new QueueRepository();
         $limit = isset($context['fetch_limit']) ? max(1, (int) $context['fetch_limit']) : max(10, (int) ($options['max_per_run'] ?? 3) * 3);
         $queued = 0;
+        $sourceKeys = array_keys($sources);
 
-        foreach (array_keys($sources) as $sourceKey) {
-            if (($options['fetch_mode'] ?? 'rss_html') === 'html_only') {
-                Log::warn($sourceKey, 'ingest', 'HTML-only discovery is not supported for this source yet');
-                continue;
-            }
-
+        foreach ($sourceKeys as $sourceKey) {
             $source = $this->makeSource($sourceKey, $http);
             if (!$source) {
                 continue;
             }
+            if (($options['fetch_mode'] ?? 'rss_html') === 'html_only' && !$source instanceof AbstractHtmlSource) {
+                Log::warn($sourceKey, 'ingest', 'HTML-only discovery is not supported for this source');
+                continue;
+            }
 
             $items = $source->fetch($limit);
+            $removedQueued = $queue->deleteQueuedForSources([$sourceKey]);
+            if ($removedQueued > 0) {
+                Log::info($sourceKey, 'ingest', 'Cleared stale queued source items after scan', [
+                    'removed' => $removedQueued,
+                ]);
+            }
+
             foreach ($items as $item) {
                 $evaluation = $dedup->evaluate($item, $options);
                 if (($evaluation['action'] ?? '') !== 'create') {
@@ -203,7 +214,12 @@ class Scheduler
                 'url' => $item['url'] ?? '',
                 'content' => $article['content'] ?? '',
                 'image' => $article['image'] ?? null,
+                'title' => $article['title'] ?? null,
             ]);
+
+            if (($item['processing_mode'] ?? '') === 'import_only') {
+                return $this->generateImportOnlyItem($itemId, $runId, $item, $article, $options, $queue, $runs, $artifacts);
+            }
 
             $openAi = new OpenAiClient((string) ($options['api_key'] ?? ''), $http);
             $briefStage = new FactBrief($openAi);
@@ -352,9 +368,271 @@ class Scheduler
                 return new LOfficielBE($http);
             case 'togethermag':
                 return new TogetherMagazineBE($http);
+            case 'bratislavskenoviny':
+                return new BratislavskeNoviny($http);
+            case 'nasekosice':
+                return new NaseKosice($http);
             default:
                 return null;
         }
+    }
+
+    /**
+     * @param array<string, mixed> $item
+     * @param array<string, mixed> $article
+     * @param array<string, mixed> $options
+     * @return int|WP_Error
+     */
+    private function generateImportOnlyItem(
+        int $itemId,
+        int $runId,
+        array $item,
+        array $article,
+        array $options,
+        QueueRepository $queue,
+        RunRepository $runs,
+        ArtifactRepository $artifacts
+    ) {
+        $title = sanitize_text_field((string) ($article['title'] ?? $item['title'] ?? ''));
+        if ($title === '') {
+            return $this->failItem($queue, $runs, $itemId, $runId, 'Import-only item has no title');
+        }
+
+        $body = $this->cleanImportOnlyBody(
+            trim((string) ($article['content'] ?? '')),
+            $title,
+            (string) ($item['source'] ?? '')
+        );
+        if (strlen(strip_tags($body)) < 200) {
+            return $this->failItem($queue, $runs, $itemId, $runId, 'Import-only article body is too short');
+        }
+        $body = $this->removeFeaturedImageFromBody(
+            $body,
+            (string) ($item['image_url'] ?? '')
+        );
+
+        $plain = Html::plainText($body);
+        $excerptSource = (string) ($item['summary'] ?? '');
+        if ($excerptSource === '') {
+            $excerptSource = mb_substr($plain, 0, 157) . (mb_strlen($plain) > 157 ? '...' : '');
+        }
+
+        $url = esc_url_raw((string) ($item['url'] ?? ''));
+        $host = parse_url($url, PHP_URL_HOST) ?: $url;
+        $content = $body . sprintf(
+            '<p><em>%s</em> <a href="%s" rel="noopener" target="_blank">%s</a></p>',
+            esc_html__('Zdroj:', 'moodbooster-autopub'),
+            esc_url($url),
+            esc_html((string) $host)
+        );
+
+        $status = ($options['publish_mode'] ?? 'draft') === 'publish' ? 'publish' : 'draft';
+        $postArgs = [
+            'post_title' => $title,
+            'post_content' => $content,
+            'post_excerpt' => sanitize_textarea_field($excerptSource),
+            'post_status' => $status,
+            'post_type' => 'post',
+            'post_author' => get_current_user_id() ?: 1,
+        ];
+
+        if (!empty($item['dt'])) {
+            $timestamp = strtotime((string) $item['dt']);
+            if ($timestamp) {
+                $postArgs['post_date_gmt'] = gmdate('Y-m-d H:i:s', $timestamp);
+                $postArgs['post_date'] = get_date_from_gmt($postArgs['post_date_gmt']);
+            }
+        }
+
+        /** @var array<string, mixed> $postArgs */
+        $postArgs = apply_filters('moodbooster_autopub_post_args', $postArgs, $item, [], [
+            'body_html' => $content,
+            'excerpt' => $excerptSource,
+        ]);
+
+        $postId = wp_insert_post($postArgs, true);
+        if (is_wp_error($postId)) {
+            return $this->failItem($queue, $runs, $itemId, $runId, $postId->get_error_message());
+        }
+
+        if (!empty($options['category'])) {
+            wp_set_post_categories((int) $postId, [(int) $options['category']]);
+        }
+
+        $meta = [
+            '_mb_source' => sanitize_text_field((string) ($item['source'] ?? 'unknown')),
+            '_mb_source_url' => $url,
+            '_mb_source_fp' => $item['fingerprint'] ?? sha1(($item['source'] ?? '') . $url),
+            '_mb_author_original' => sanitize_text_field((string) ($item['author'] ?? '')),
+            '_mb_published_original' => sanitize_text_field((string) ($item['dt'] ?? '')),
+            '_mb_image_source_url' => $item['image_url'] ?? '',
+            '_mb_pipeline_version' => \Moodbooster\AutoPub\VERSION,
+            '_mb_processing_mode' => 'import_only',
+            '_mb_factcheck_status' => 'import_only',
+            '_mb_v2_item_id' => $itemId,
+            '_mb_v2_run_id' => $runId,
+        ];
+
+        $meta = apply_filters('moodbooster_autopub_post_meta', $meta, $item, [], [
+            'body_html' => $content,
+            'excerpt' => $excerptSource,
+        ], ['approval' => true]);
+        foreach ($meta as $key => $value) {
+            update_post_meta((int) $postId, $key, $value);
+        }
+
+        $images = new Images(new HttpClient());
+        $imageResult = $images->pick($item, $options, (string) ($article['original_html'] ?? ''), []);
+        if (!is_wp_error($imageResult)) {
+            $artifacts->save($itemId, $runId, 'image_selection', [
+                'status' => 'selected',
+                'source_url' => $imageResult['source_url'] ?? '',
+                'selection' => $imageResult['selection'] ?? [],
+                'candidates' => $imageResult['candidates'] ?? [],
+            ]);
+
+            $attachmentId = $images->attach($imageResult, (int) $postId);
+            if (!is_wp_error($attachmentId)) {
+                update_post_meta((int) $postId, '_mb_image_source_url', esc_url_raw($imageResult['source_url'] ?? ''));
+            }
+        } else {
+            $imageErrorData = $imageResult->get_error_data($imageResult->get_error_code());
+            $artifacts->save($itemId, $runId, 'image_selection', [
+                'status' => 'failed',
+                'error' => $imageResult->get_error_message(),
+                'candidates' => is_array($imageErrorData) ? ($imageErrorData['candidates'] ?? []) : [],
+            ]);
+        }
+
+        $artifacts->save($itemId, $runId, 'import_only', [
+            'post_id' => (int) $postId,
+            'status' => $status,
+            'source_url' => $url,
+        ]);
+
+        $queue->markDraft($itemId, (int) $postId, false);
+        $runs->finish($runId, 'success');
+
+        Log::info($item['source'] ?? 'source', 'publish', 'Import-only post created', [
+            'post_id' => (int) $postId,
+            'status' => $status,
+        ]);
+
+        return (int) $postId;
+    }
+
+    private function cleanImportOnlyBody(string $body, string $title, string $source): string
+    {
+        $body = trim($body);
+        if ($body === '') {
+            return '';
+        }
+
+        if (strpos($body, '<p') !== false) {
+            $prefix = preg_split('/<p\b/i', $body, 2);
+            if (is_array($prefix) && count($prefix) === 2) {
+                $prefixText = Html::plainText($prefix[0]);
+                if ($this->sameTextPrefix($prefixText, $title) || $source === 'bratislavskenoviny' || $source === 'nasekosice') {
+                    $body = '<p' . $prefix[1];
+                }
+            }
+        }
+
+        if ($source === 'bratislavskenoviny') {
+            $body = preg_replace('/Páčil sa vám článok\\?/iu', '', $body) ?? $body;
+            $body = preg_replace('#<p[^>]*>\\s*(?:<em>\\s*)?Zdroj:\\s*.*?</p>#isu', '', $body) ?? $body;
+            $body = preg_replace('#<p[^>]*>\\s*0\\s*</p>#isu', '', $body) ?? $body;
+        }
+
+        if ($source === 'nasekosice') {
+            $body = $this->removeNaseKosiceSummaryBlocks($body);
+        }
+
+        $body = preg_replace('#<p[^>]*>\\s*</p>#isu', '', $body) ?? $body;
+        $body = preg_replace('/[ \\t]{2,}/', ' ', $body) ?? $body;
+
+        return trim($body);
+    }
+
+    private function removeFeaturedImageFromBody(string $body, string $imageUrl): string
+    {
+        $featuredUrl = $this->canonicalImageUrl($imageUrl);
+        if ($featuredUrl === '') {
+            return $body;
+        }
+
+        if (stripos($body, '<img') === false) {
+            return $body;
+        }
+
+        $body = preg_replace_callback(
+            '#<figure\b[^>]*>\s*(<img\b[^>]*>)\s*</figure>#isu',
+            function (array $matches) use ($featuredUrl): string {
+                return $this->imgTagMatchesUrl($matches[1], $featuredUrl) ? '' : $matches[0];
+            },
+            $body
+        ) ?? $body;
+
+        $body = preg_replace_callback(
+            '#<img\b[^>]*>#isu',
+            function (array $matches) use ($featuredUrl): string {
+                return $this->imgTagMatchesUrl($matches[0], $featuredUrl) ? '' : $matches[0];
+            },
+            $body
+        ) ?? $body;
+
+        $body = preg_replace('#<figure\b[^>]*>\s*</figure>#isu', '', $body) ?? $body;
+        $body = preg_replace('#<p[^>]*>\s*</p>#isu', '', $body) ?? $body;
+
+        return trim($body);
+    }
+
+    private function imgTagMatchesUrl(string $imgTag, string $featuredUrl): bool
+    {
+        if (preg_match('/\ssrc\s*=\s*(["\'])(.*?)\1/isu', $imgTag, $match) !== 1) {
+            return false;
+        }
+
+        return $this->canonicalImageUrl($match[2]) === $featuredUrl;
+    }
+
+    private function canonicalImageUrl(string $url): string
+    {
+        $url = html_entity_decode(trim($url), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        if ($url === '') {
+            return '';
+        }
+
+        return esc_url_raw($url);
+    }
+
+    private function sameTextPrefix(string $candidate, string $title): bool
+    {
+        $candidate = mb_strtolower(trim(preg_replace('/\\s+/u', ' ', $candidate) ?? $candidate));
+        $title = mb_strtolower(trim(preg_replace('/\\s+/u', ' ', $title) ?? $title));
+        if ($candidate === '' || $title === '') {
+            return false;
+        }
+
+        return strpos($candidate, $title) === 0 || strpos($title, $candidate) === 0;
+    }
+
+    private function removeNaseKosiceSummaryBlocks(string $body): string
+    {
+        $body = preg_replace('/Zobraziť rýchly súhrn|Schovať rýchly súhrn/iu', '', $body) ?? $body;
+
+        return preg_replace_callback(
+            '#<p[^>]*>.*?</p>#isu',
+            static function (array $matches): string {
+                $plain = Html::plainText($matches[0]);
+                if (stripos($plain, 'Rýchly súhrn článku') !== false) {
+                    return '';
+                }
+
+                return $matches[0];
+            },
+            $body
+        ) ?? $body;
     }
 
     /**

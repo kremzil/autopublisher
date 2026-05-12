@@ -11,12 +11,14 @@ use Moodbooster\AutoPub\Pipeline\FactCheck;
 use Moodbooster\AutoPub\Pipeline\Headline;
 use Moodbooster\AutoPub\Pipeline\Planner;
 use Moodbooster\AutoPub\Pipeline\Writer;
+use Moodbooster\AutoPub\Sources\BratislavskeNoviny;
 use Moodbooster\AutoPub\Sources\EuropaWire;
 use Moodbooster\AutoPub\Sources\FashionPost;
 use Moodbooster\AutoPub\Sources\FashionStreetHU;
 use Moodbooster\AutoPub\Sources\EllePolska;
 use Moodbooster\AutoPub\Sources\MarieClaireHU;
 use Moodbooster\AutoPub\Sources\MiastoKobiet;
+use Moodbooster\AutoPub\Sources\NaseKosice;
 use Moodbooster\AutoPub\Sources\LOfficielBE;
 use Moodbooster\AutoPub\Sources\SourceInterface;
 use Moodbooster\AutoPub\Sources\TogetherMagazineBE;
@@ -209,6 +211,10 @@ final class Cli extends WP_CLI_Command
                 return new LOfficielBE($http);
             case 'togethermag':
                 return new TogetherMagazineBE($http);
+            case 'bratislavskenoviny':
+                return new BratislavskeNoviny($http);
+            case 'nasekosice':
+                return new NaseKosice($http);
             default:
                 return null;
         }

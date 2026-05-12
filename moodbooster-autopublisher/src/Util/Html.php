@@ -13,7 +13,7 @@ final class Html
         return preg_replace('/<\s*a[^>]*>(.*?)<\s*\/\s*a\s*>/is', '$1', $html) ?? $html;
     }
 
-    public static function normalizeBody(string $html): string
+    public static function normalizeBody(string $html, bool $allowImages = false): string
     {
         $html = self::stripLinks($html);
         $allowed = [
@@ -24,6 +24,20 @@ final class Html
             'blockquote' => [],
             'br' => [],
         ];
+        if ($allowImages) {
+            $allowed['figure'] = [];
+            $allowed['figcaption'] = [];
+            $allowed['img'] = [
+                'src' => true,
+                'alt' => true,
+                'title' => true,
+                'width' => true,
+                'height' => true,
+                'loading' => true,
+                'decoding' => true,
+                'class' => true,
+            ];
+        }
 
         return wp_kses($html, $allowed);
     }

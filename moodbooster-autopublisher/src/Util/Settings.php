@@ -23,6 +23,8 @@ final class Settings
                 'fashionstreethu' => false,
                 'lofficielbe' => false,
                 'togethermag' => false,
+                'bratislavskenoviny' => false,
+                'nasekosice' => false,
             ],
             'fetch_mode' => 'rss_html',
             'publish_mode' => 'draft',

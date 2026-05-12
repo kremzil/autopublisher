@@ -522,6 +522,8 @@ final class SettingsPage
             'fashionstreethu' => __('Fashion Street Online', 'moodbooster-autopub'),
             'lofficielbe' => __('L\'Officiel Belgique', 'moodbooster-autopub'),
             'togethermag' => __('Together Magazine', 'moodbooster-autopub'),
+            'bratislavskenoviny' => __('Bratislavské noviny', 'moodbooster-autopub'),
+            'nasekosice' => __('Naše Košice', 'moodbooster-autopub'),
         ];
     }
 }

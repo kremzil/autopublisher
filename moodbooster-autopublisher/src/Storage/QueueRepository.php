@@ -104,6 +104,30 @@ final class QueueRepository
     }
 
     /**
+     * @param array<int, string> $sources
+     */
+    public function deleteQueuedForSources(array $sources): int
+    {
+        global $wpdb;
+
+        $sources = array_values(array_filter(array_map('sanitize_key', $sources)));
+        if ($sources === []) {
+            return 0;
+        }
+
+        $table = Database::itemsTable();
+        $placeholders = implode(',', array_fill(0, count($sources), '%s'));
+        $sql = $wpdb->prepare(
+            "DELETE FROM {$table} WHERE status = %s AND source IN ({$placeholders})",
+            array_merge([self::STATUS_QUEUED], $sources)
+        );
+
+        $wpdb->query($sql);
+
+        return (int) $wpdb->rows_affected;
+    }
+
+    /**
      * @return array<string, mixed>|null
      */
     public function find(int $id): ?array

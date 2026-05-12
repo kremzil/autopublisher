@@ -464,6 +464,9 @@ final class Images
         }
 
         $fileName = basename(parse_url($url, PHP_URL_PATH) ?: 'image.jpg');
+        if (pathinfo($fileName, PATHINFO_EXTENSION) === '') {
+            $fileName .= $this->extensionForMime((string) $mime);
+        }
 
         return [
             'tmp_path' => $tmp,
@@ -544,5 +547,19 @@ final class Images
         }
 
         return null;
+    }
+
+    private function extensionForMime(string $mime): string
+    {
+        $mime = strtolower($mime);
+        $map = [
+            'image/jpeg' => '.jpg',
+            'image/jpg' => '.jpg',
+            'image/png' => '.png',
+            'image/webp' => '.webp',
+            'image/gif' => '.gif',
+        ];
+
+        return $map[$mime] ?? '.jpg';
     }
 }

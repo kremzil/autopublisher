@@ -11,16 +11,17 @@ use DOMXPath;
 final class ContentExtractor
 {
     /**
-     * @return array{content:string,image?:string}
+     * @return array{content:string,image?:string,title?:string}
      */
     public static function extract(string $html, ?string $baseUrl = null): array
     {
         $doc = self::parseHtml($html);
         if (!$doc) {
-            return ['content' => Html::normalizeBody($html)];
+            return ['content' => Html::normalizeBody($html, true)];
         }
 
         self::removeNodes($doc, ['script', 'style', 'noscript', 'iframe', 'form', 'nav', 'header', 'footer']);
+        self::prepareImagesForBody($doc, $baseUrl);
 
         $contentNode = self::findContentNode($doc);
 
@@ -35,16 +36,18 @@ final class ContentExtractor
             }
 
             return [
-                'content' => Html::normalizeBody($buffer),
+                'content' => Html::normalizeBody($buffer, true),
                 'image' => self::findFirstImage($doc, $baseUrl),
+                'title' => self::findTitle($doc),
             ];
         }
 
         $htmlContent = $doc->saveHTML($contentNode) ?: '';
 
         return [
-            'content' => Html::normalizeBody($htmlContent),
+            'content' => Html::normalizeBody($htmlContent, true),
             'image' => self::findFirstImage($contentNode, $baseUrl),
+            'title' => self::findTitle($doc),
         ];
     }
 
@@ -89,19 +92,110 @@ final class ContentExtractor
     private static function findContentNode(DOMDocument $doc): ?DOMElement
     {
         $xpath = new DOMXPath($doc);
-        $article = $xpath->query('//article');
-        if ($article instanceof \DOMNodeList && $article->length > 0) {
-            $node = $article->item(0);
-            if ($node instanceof DOMElement) {
-                return $node;
+        $preferred = $xpath->query(
+            '//div[@data-reader-content]'
+            . ' | //div[contains(concat(" ", normalize-space(@class), " "), " reader-content ")]'
+            . ' | //div[contains(concat(" ", normalize-space(@class), " "), " article-body ")]'
+            . ' | //div[contains(concat(" ", normalize-space(@class), " "), " c-rte ")]'
+        );
+        if ($preferred instanceof \DOMNodeList && $preferred->length > 0) {
+            $best = null;
+            $bestScore = 0;
+            foreach ($preferred as $node) {
+                if (!$node instanceof DOMElement) {
+                    continue;
+                }
+
+                $score = strlen(Html::plainText($node->textContent));
+                if ($score > $bestScore) {
+                    $best = $node;
+                    $bestScore = $score;
+                }
+            }
+
+            if ($best instanceof DOMElement && $bestScore >= 200) {
+                return $best;
             }
         }
 
-        $candidates = $xpath->query('//div[contains(@class,"content") or contains(@class,"article") or contains(@class,"post")]');
-        if ($candidates instanceof \DOMNodeList && $candidates->length > 0) {
-            $node = $candidates->item(0);
+        $headings = $xpath->query('//h1');
+        if ($headings instanceof \DOMNodeList && $headings->length > 0) {
+            $node = $headings->item(0);
+            while ($node instanceof DOMNode && $node->parentNode instanceof DOMNode) {
+                $node = $node->parentNode;
+                if (!$node instanceof DOMElement || in_array(strtolower($node->tagName), ['body', 'html'], true)) {
+                    break;
+                }
+
+                $paragraphs = $xpath->query('.//p', $node);
+                $paragraphCount = $paragraphs instanceof \DOMNodeList ? $paragraphs->length : 0;
+                $score = strlen(Html::plainText($node->textContent));
+                if ($paragraphCount >= 2 && $score >= 300) {
+                    return $node;
+                }
+            }
+        }
+
+        $queries = [
+            '//article',
+            '//div[contains(concat(" ", normalize-space(@class), " "), " content ") or contains(concat(" ", normalize-space(@class), " "), " article ") or contains(concat(" ", normalize-space(@class), " "), " post ") or contains(concat(" ", normalize-space(@class), " "), " text ")]',
+        ];
+
+        $best = null;
+        $bestScore = 0;
+        foreach ($queries as $query) {
+            $candidates = $xpath->query($query);
+            if (!$candidates instanceof \DOMNodeList) {
+                continue;
+            }
+
+            foreach ($candidates as $node) {
+                if (!$node instanceof DOMElement) {
+                    continue;
+                }
+
+                $score = strlen(Html::plainText($node->textContent));
+                if ($score > $bestScore) {
+                    $best = $node;
+                    $bestScore = $score;
+                }
+            }
+        }
+
+        return $best;
+    }
+
+    private static function findTitle(DOMDocument $doc): ?string
+    {
+        $xpath = new DOMXPath($doc);
+        $h1 = $xpath->query('//h1');
+        if ($h1 instanceof \DOMNodeList && $h1->length > 0) {
+            $node = $h1->item(0);
+            if ($node instanceof DOMNode) {
+                $title = Html::plainText($node->textContent);
+                if ($title !== '') {
+                    return $title;
+                }
+            }
+        }
+
+        $ogTitle = $xpath->query('//meta[@property="og:title" or @name="twitter:title"]');
+        if ($ogTitle instanceof \DOMNodeList && $ogTitle->length > 0) {
+            $node = $ogTitle->item(0);
             if ($node instanceof DOMElement) {
-                return $node;
+                $title = Html::plainText($node->getAttribute('content'));
+                if ($title !== '') {
+                    return $title;
+                }
+            }
+        }
+
+        $title = $doc->getElementsByTagName('title')->item(0);
+        if ($title instanceof DOMNode) {
+            $text = Html::plainText($title->textContent);
+            if ($text !== '') {
+                $parts = preg_split('/\s+[|\x{2013}-]\s+/u', $text);
+                return is_array($parts) ? ($parts[0] ?? $text) : $text;
             }
         }
 
@@ -129,17 +223,6 @@ final class ContentExtractor
         }
 
         $xpath = new DOMXPath($document);
-        $nodes = $context instanceof DOMDocument ? $xpath->query('.//img') : $xpath->query('.//img', $context);
-        if ($nodes instanceof \DOMNodeList && $nodes->length > 0) {
-            $first = $nodes->item(0);
-            if ($first instanceof DOMElement) {
-                $src = self::imageUrlFromElement($first);
-                if ($src !== null) {
-                    return self::absUrl($src, $baseUrl);
-                }
-            }
-        }
-
         $meta = $xpath->query('//meta[@property="og:image" or @property="og:image:secure_url" or @name="og:image" or @name="twitter:image" or @property="twitter:image" or @name="twitter:image:src"]');
         if ($meta instanceof \DOMNodeList && $meta->length > 0) {
             $firstMeta = $meta->item(0);
@@ -151,7 +234,58 @@ final class ContentExtractor
             }
         }
 
+        $nodes = $context instanceof DOMDocument ? $xpath->query('.//img') : $xpath->query('.//img', $context);
+        if ($nodes instanceof \DOMNodeList && $nodes->length > 0) {
+            $first = $nodes->item(0);
+            if ($first instanceof DOMElement) {
+                $src = self::imageUrlFromElement($first);
+                if ($src !== null) {
+                    return self::absUrl($src, $baseUrl);
+                }
+            }
+        }
+
         return null;
+    }
+
+    private static function prepareImagesForBody(DOMNode $context, ?string $baseUrl): void
+    {
+        $document = $context instanceof DOMDocument ? $context : $context->ownerDocument;
+        if (!$document instanceof DOMDocument) {
+            return;
+        }
+
+        $xpath = new DOMXPath($document);
+        $nodes = $context instanceof DOMDocument ? $xpath->query('.//img') : $xpath->query('.//img', $context);
+        if (!$nodes instanceof \DOMNodeList) {
+            return;
+        }
+
+        foreach ($nodes as $node) {
+            if (!$node instanceof DOMElement) {
+                continue;
+            }
+
+            $src = self::imageUrlFromElement($node);
+            if ($src === null || $src === '') {
+                if ($node->parentNode) {
+                    $node->parentNode->removeChild($node);
+                }
+                continue;
+            }
+
+            $node->setAttribute('src', self::absUrl($src, $baseUrl));
+            if (!$node->hasAttribute('loading')) {
+                $node->setAttribute('loading', 'lazy');
+            }
+            if (!$node->hasAttribute('decoding')) {
+                $node->setAttribute('decoding', 'async');
+            }
+
+            foreach (['data-src', 'data-lazy-src', 'data-original', 'data-image', 'srcset', 'data-srcset', 'sizes'] as $attribute) {
+                $node->removeAttribute($attribute);
+            }
+        }
     }
 
     /**
