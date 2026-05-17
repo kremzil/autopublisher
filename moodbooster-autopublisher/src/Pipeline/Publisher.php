@@ -73,11 +73,6 @@ final class Publisher
             'post_author' => get_current_user_id() ?: 1,
         ];
 
-        if (!empty($item['dt'])) {
-            $postArgs['post_date_gmt'] = gmdate('Y-m-d H:i:s', strtotime((string) $item['dt']));
-            $postArgs['post_date'] = get_date_from_gmt($postArgs['post_date_gmt']);
-        }
-
         /** @var array<string, mixed> $postArgs */
         $postArgs = apply_filters('moodbooster_autopub_post_args', $postArgs, $item, $plan, $draft);
 
